@@ -35,8 +35,9 @@ and just fails fast when away).
 
 ## Milestones
 
-- [x] 0. Walking skeleton: window + D3D9 device + clear + one triangle + FPS title
-- [ ] 1. Textured cube, fly camera (WASD+mouse), 16-bit backbuffer test
+- [x] 0. Walking skeleton: window + D3D9 device + clear + one triangle + FPS title — **177 FPS**
+- [x] 1. Textured cube, fly camera (WASD+mouse), depth buffer, procedural texture — **160-164 FPS**
+      (16-bit backbuffer test deferred to milestone 3, where fill rate starts to matter)
 - [ ] 2. One chunk (16x16x16), naive per-face meshing, texture atlas
 - [ ] 3. Chunk grid + frustum culling + greedy meshing; measure the FPS/view-range curve
 - [ ] 4. Block break/place, raycast, save/load
