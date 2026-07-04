@@ -3,7 +3,7 @@
 
 CC      = i686-w64-mingw32-gcc
 CFLAGS  = -O2 -Wall -Wextra -std=c99
-LDFLAGS = -ld3d9 -lgdi32 -luser32 -mwindows -static-libgcc
+LDFLAGS = -ld3d9 -lgdi32 -luser32 -lwinmm -mwindows -static-libgcc
 
 BUILD   = build
 DEPLOY  = /media/Acer_Notebook/xp-craft

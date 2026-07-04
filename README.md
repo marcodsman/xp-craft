@@ -52,7 +52,10 @@ and just fails fast when away).
       remotely: placed planks on screen, byte-counted them in world.dat, survived a
       kill+relaunch, broke one and watched the count drop. y=0 is bedrock.
 - [ ] 5. Terrain gen (value noise), day/night, the game part
-- [ ] Stretch: gamepad support, launch entry in xp-launcher
+- [x] Stretch: gamepad support (WinMM, verified with the real pad: stick move/look,
+      POV-hat move, btn1 break, btn2 place, btn3 cycle block, L1/R1 down/up,
+      Start saves; title shows PAD once input is seen) and a top-billing entry
+      in xp-launcher's games list.
 
 ## Style
 

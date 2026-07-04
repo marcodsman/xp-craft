@@ -25,6 +25,7 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
 #include <d3d9.h>
 #include <math.h>
 #include <stdio.h>
@@ -702,7 +703,6 @@ static void update_camera(float dt, float t)
     if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_cam_y -= speed; }
 
     /* hold-repeat only; the initial click arrives via WM_L/RBUTTONDOWN */
-    g_click_cd -= dt;
     int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     int rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     if ((lmb || rmb) && g_click_cd <= 0) {
@@ -731,6 +731,87 @@ static void update_camera(float dt, float t)
         if (g_pitch < -1.55f) g_pitch = -1.55f;
     }
     SetCursorPos(center.x, center.y);
+}
+
+/* ------------------------------------------------------------- gamepad --- */
+/* WinMM pad (see tools/joyprobe.c): the box's controller shows as two ids —
+ * id 1 carries X/Y + POV hat + buttons, id 0 the other axis pair. Look input
+ * picks whichever id-0 axis pair actually deflects, so the exact wiring of
+ * the twin interface doesn't matter. Buttons: 1=break 2=place 3=cycle block
+ * L1/R1(0x10/0x20)=down/up Start(0x200)=save. */
+
+static int g_pad_seen;
+
+static float pad_axis(DWORD v)
+{
+    float f = ((int)v - 32767) / 32767.0f;
+    if (f > -0.25f && f < 0.25f) return 0;      /* deadzone */
+    return f < 0 ? (f + 0.25f) / 0.75f : (f - 0.25f) / 0.75f;
+}
+
+static void update_gamepad(float dt)
+{
+    JOYINFOEX j0 = { sizeof j0, JOY_RETURNALL };
+    JOYINFOEX j1 = { sizeof j1, JOY_RETURNALL };
+    int ok0 = joyGetPosEx(0, &j0) == JOYERR_NOERROR;
+    int ok1 = joyGetPosEx(1, &j1) == JOYERR_NOERROR;
+    if (!ok0 && !ok1) return;
+
+    /* movement: id-1 stick, plus POV hat as digital move */
+    float strafe = 0, forward = 0;
+    if (ok1) {
+        strafe  =  pad_axis(j1.dwXpos);
+        forward = -pad_axis(j1.dwYpos);         /* stick up = low value */
+        if (j1.dwPOV != JOY_POVCENTERED && j1.dwPOV <= 35900) {
+            float a = j1.dwPOV / 100.0f * 3.14159265f / 180.0f;
+            strafe  += sinf(a);
+            forward += cosf(a);
+        }
+    }
+
+    /* look: strongest-deflection pair on id 0 */
+    float lx = 0, ly = 0;
+    if (ok0) {
+        float ax = pad_axis(j0.dwXpos), az = pad_axis(j0.dwZpos);
+        float ay = pad_axis(j0.dwYpos), ar = pad_axis(j0.dwRpos);
+        lx = fabsf(az) > fabsf(ax) ? az : ax;
+        ly = fabsf(ar) > fabsf(ay) ? ar : ay;
+    }
+
+    DWORD b = (ok1 ? j1.dwButtons : 0) | (ok0 ? j0.dwButtons : 0);
+
+    if (strafe != 0 || forward != 0 || lx != 0 || ly != 0 || b) {
+        g_manual = 1;
+        g_pad_seen = 1;
+    }
+
+    float speed = 10.0f * dt;
+    float fx = sinf(g_yaw), fz = cosf(g_yaw);
+    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
+    g_cam_x += (fx * forward + rx * strafe) * speed;
+    g_cam_z += (fz * forward + rz * strafe) * speed;
+    if (b & 0x10) g_cam_y -= speed;             /* L1 down */
+    if (b & 0x20) g_cam_y += speed;             /* R1 up */
+
+    g_yaw   += lx * 2.6f * dt;
+    g_pitch += ly * 2.6f * dt;
+    if (g_pitch >  1.55f) g_pitch =  1.55f;
+    if (g_pitch < -1.55f) g_pitch = -1.55f;
+
+    /* held with cooldown: break/place (shares the mouse cooldown) */
+    if ((b & 0x01) || (b & 0x02)) {
+        if (g_click_cd <= 0) {
+            if (b & 0x01) edit_break(); else edit_place();
+            g_click_cd = 0.22f;
+        }
+    }
+
+    /* edge-triggered: cycle block, save */
+    static DWORD prevb;
+    DWORD pressed = b & ~prevb;
+    prevb = b;
+    if (pressed & 0x04) g_sel = 1 + (g_sel % (NBLOCKS - 1));
+    if (pressed & 0x200) save_world();
 }
 
 /* --------------------------------------------------------------- d3d9 ----- */
@@ -1012,7 +1093,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_yaw = (float)(td * (2.0 * 3.14159265 / 8.0));  /* full pan / 8s */
             g_pitch = 0.15f;
         } else {
+            g_click_cd -= dt;       /* shared break/place cooldown */
             update_camera(dt, (float)td);
+            update_gamepad(dt);
         }
 
         tris = render_frame(&nchunks);
@@ -1024,9 +1107,10 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         if (sec >= 1.0) {
             char title[160];
             sprintf(title, "xp-craft - %.0f FPS - r=%.0f - %d tris, %d chunks"
-                           " - %s VP - place: %s - remesh %d ms",
+                           " - %s VP - place: %s - remesh %d ms%s",
                     frames / sec, g_range, tris, nchunks,
-                    g_hwvp ? "HW" : "SW", BLOCK_NAME[g_sel], g_remesh_ms);
+                    g_hwvp ? "HW" : "SW", BLOCK_NAME[g_sel], g_remesh_ms,
+                    g_pad_seen ? " - PAD" : "");
             SetWindowTextA(g_hwnd, title);
             frames = 0;
             t0 = now;
