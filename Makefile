@@ -2,13 +2,14 @@
 # Needs: gcc-mingw-w64-i686. D3D9 import lib ships with mingw-w64.
 
 CC      = i686-w64-mingw32-gcc
-CFLAGS  = -O2 -Wall -Wextra -std=c99
+PAD     = ../xp-pad/src
+CFLAGS  = -O2 -Wall -Wextra -std=c99 -I$(PAD)
 LDFLAGS = -ld3d9 -lgdi32 -luser32 -lwinmm -mwindows -static-libgcc
 
 BUILD   = build
 DEPLOY  = /media/Acer_Notebook/xp-craft
 
-SRC     = $(wildcard src/*.c)
+SRC     = $(wildcard src/*.c) $(PAD)/pad.c
 
 all: $(BUILD)/xp-craft.exe
 

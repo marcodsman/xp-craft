@@ -30,6 +30,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "pad.h"                    /* ../xp-pad/src — shared pad mapping */
 
 #define WIN_W 800
 #define WIN_H 600
@@ -734,13 +735,54 @@ static void update_camera(float dt, float t)
 }
 
 /* ------------------------------------------------------------- gamepad --- */
-/* WinMM pad (see tools/joyprobe.c): the box's controller shows as two ids —
- * id 1 carries X/Y + POV hat + buttons, id 0 the other axis pair. Look input
- * picks whichever id-0 axis pair actually deflects, so the exact wiring of
- * the twin interface doesn't matter. Buttons: 1=break 2=place 3=cycle block
- * L1/R1(0x10/0x20)=down/up Start(0x200)=save. */
+/* Preferred path: the shared xp-pad mapping (C:\XP_Share\pad.cfg, made by
+ * padwiz) via pad.h — real PS buttons: lstick/dpad move, rstick look,
+ * R2 break, L2 place, CROSS/CIRCLE fly up/down, SQUARE cycles the block,
+ * START saves. Fallback when pad.cfg is missing: the old raw-bit heuristic
+ * (see tools/joyprobe.c). */
 
 static int g_pad_seen;
+static int g_pad_mapped;            /* pad.cfg loaded */
+
+static void update_gamepad_mapped(float dt)
+{
+    PadState p;
+    pad_poll(&p);
+    if (!p.connected) return;
+
+    float strafe  = p.lx + (p.right ? 1.0f : 0) - (p.left ? 1.0f : 0);
+    float forward = p.ly + (p.up ? 1.0f : 0) - (p.down ? 1.0f : 0);
+
+    if (strafe != 0 || forward != 0 || p.rx != 0 || p.ry != 0 ||
+        p.cross || p.circle || p.square || p.l2 || p.r2 || p.start) {
+        g_manual = 1;
+        g_pad_seen = 1;
+    }
+
+    float speed = 10.0f * dt;
+    float fx = sinf(g_yaw), fz = cosf(g_yaw);
+    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
+    g_cam_x += (fx * forward + rx * strafe) * speed;
+    g_cam_z += (fz * forward + rz * strafe) * speed;
+    if (p.cross)  g_cam_y += speed;
+    if (p.circle) g_cam_y -= speed;
+
+    g_yaw   += p.rx * 2.6f * dt;
+    g_pitch -= p.ry * 2.6f * dt;    /* stick up = look up */
+    if (g_pitch >  1.55f) g_pitch =  1.55f;
+    if (g_pitch < -1.55f) g_pitch = -1.55f;
+
+    if ((p.r2 || p.l2) && g_click_cd <= 0) {
+        if (p.r2) edit_break(); else edit_place();
+        g_click_cd = 0.22f;
+    }
+
+    static unsigned prev_sq, prev_st;
+    if (p.square && !prev_sq) g_sel = 1 + (g_sel % (NBLOCKS - 1));
+    if (p.start && !prev_st) save_world();
+    prev_sq = p.square;
+    prev_st = p.start;
+}
 
 static float pad_axis(DWORD v)
 {
@@ -751,6 +793,11 @@ static float pad_axis(DWORD v)
 
 static void update_gamepad(float dt)
 {
+    if (g_pad_mapped) {
+        update_gamepad_mapped(dt);
+        return;
+    }
+
     JOYINFOEX j0 = { sizeof j0, JOY_RETURNALL };
     JOYINFOEX j1 = { sizeof j1, JOY_RETURNALL };
     int ok0 = joyGetPosEx(0, &j0) == JOYERR_NOERROR;
@@ -1055,6 +1102,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         return 1;
     }
     world_file_path();
+    g_pad_mapped = pad_load("C:\\XP_Share\\pad.cfg");
     if (!load_world()) gen_world();
     if (!build_world_meshes()) {
         MessageBoxA(NULL, "mesh build failed", "xp-craft", MB_ICONERROR);
