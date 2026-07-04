@@ -793,6 +793,10 @@ static float pad_axis(DWORD v)
 
 static void update_gamepad(float dt)
 {
+    /* only the foreground app owns the pad (else menu navigation in the
+     * launcher would fly the camera in a backgrounded xp-craft) */
+    if (GetForegroundWindow() != g_hwnd) return;
+
     if (g_pad_mapped) {
         update_gamepad_mapped(dt);
         return;
