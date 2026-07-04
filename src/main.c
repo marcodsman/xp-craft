@@ -1,11 +1,12 @@
-/* xp-craft milestone 1 — textured spinning cube + fly camera + depth buffer.
+/* xp-craft milestone 2 — one chunk (16x16x16), naive meshing, texture atlas.
  *
- * First real 3D: fixed-function T&L (SetTransform), D16 depth, point-sampled
- * procedural texture, Minecraft-style per-face shading baked into vertex color.
- * The cube autorotates so an xpshot screenshot proves rendering without input;
- * at the box: WASD + E/Q fly, mouse-look while the window has focus, ESC quits.
+ * Blocks: air/grass/dirt/stone. A face is emitted only when the neighbor is
+ * air; the mesh goes into a static write-only vertex buffer built once at
+ * startup. Atlas is 4 procedural 64x64 tiles (grass-top, grass-side, dirt,
+ * stone) in a 256x64 strip — still zero asset files to deploy.
  *
- * No D3DX (mingw-w64 doesn't ship it) — small row-vector mat4 helpers instead.
+ * Camera auto-orbits the chunk (so remote screenshots sweep all angles);
+ * first WASD/E/Q press switches to manual fly + mouse-look. ESC quits.
  */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -13,25 +14,39 @@
 #include <d3d9.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define WIN_W 800
 #define WIN_H 600
-#define TEX_SIZE 64
+
+#define CHUNK 16
+#define TILE  64                    /* atlas tile size in pixels */
+#define NTILES 4
+#define USTEP (1.0f / NTILES)
+
+enum { B_AIR, B_GRASS, B_DIRT, B_STONE };
+enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
+enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE };
 
 typedef struct { float x, y, z; DWORD color; float u, v; } VTX;
 #define VTX_FVF (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
 
-static IDirect3D9        *g_d3d;
-static IDirect3DDevice9  *g_dev;
-static IDirect3DTexture9 *g_tex;
-static D3DPRESENT_PARAMETERS g_pp;
+static IDirect3D9             *g_d3d;
+static IDirect3DDevice9       *g_dev;
+static IDirect3DTexture9      *g_tex;
+static IDirect3DVertexBuffer9 *g_vb;
+static D3DPRESENT_PARAMETERS   g_pp;
 static int  g_running = 1;
+static int  g_ntris;
+static int  g_mesh_ms;
 static HWND g_hwnd;
 
-/* fly camera — spawn above and behind, looking down at the cube so a single
- * screenshot exercises top face, two sides, shading, and culling at once */
-static float g_cam_x, g_cam_y = 2.2f, g_cam_z = -2.6f;
-static float g_yaw, g_pitch = 0.7f;
+static BYTE g_blocks[CHUNK][CHUNK][CHUNK];   /* [y][z][x] */
+
+/* fly camera (orbit until first movement key) */
+static float g_cam_x, g_cam_y, g_cam_z;
+static float g_yaw, g_pitch;
+static int   g_manual;
 
 /* ---------------------------------------------------------------- mat4 --- */
 /* D3D row-vector convention: v' = v * M, D3DMATRIX.m[row][col]. */
@@ -76,7 +91,6 @@ static D3DMATRIX mat_translate(float x, float y, float z)
     return m;
 }
 
-/* left-handed perspective, like D3DXMatrixPerspectiveFovLH */
 static D3DMATRIX mat_perspective(float fovy, float aspect, float zn, float zf)
 {
     float h = 1.0f / tanf(fovy * 0.5f);
@@ -89,7 +103,6 @@ static D3DMATRIX mat_perspective(float fovy, float aspect, float zn, float zf)
     return m;
 }
 
-/* world -> view: undo camera position, then yaw, then pitch */
 static D3DMATRIX mat_view(void)
 {
     D3DMATRIX t  = mat_translate(-g_cam_x, -g_cam_y, -g_cam_z);
@@ -99,62 +112,172 @@ static D3DMATRIX mat_view(void)
     return mat_mul(&m, &rx);
 }
 
-/* ---------------------------------------------------------------- cube ---- */
-/* Minecraft-ish face shading baked into diffuse: top 100%, N/S 80%, E/W 60%,
- * bottom 50%. Texture modulates against it (stage-0 default MODULATE). */
+/* --------------------------------------------------------------- chunk ---- */
 
-static DWORD shade(int pct)
+static int block_at(int x, int y, int z)
 {
-    int v = 255 * pct / 100;
-    return D3DCOLOR_XRGB(v, v, v);
+    if (x < 0 || y < 0 || z < 0 || x >= CHUNK || y >= CHUNK || z >= CHUNK)
+        return B_AIR;
+    return g_blocks[y][z][x];
 }
 
-#define FACE(ax,ay,az, bx,by,bz, cx,cy,cz, dx,dy,dz, col) \
-    { ax,ay,az, col, 0,0 }, { bx,by,bz, col, 1,0 }, { cx,cy,cz, col, 1,1 }, \
-    { ax,ay,az, col, 0,0 }, { cx,cy,cz, col, 1,1 }, { dx,dy,dz, col, 0,1 }
-
-static VTX g_cube[36];
-
-static void build_cube(void)
+static void gen_terrain(void)
 {
-    const VTX cube[36] = {
-        /* +Y top    */ FACE(-.5f, .5f,-.5f,  .5f, .5f,-.5f,  .5f, .5f, .5f, -.5f, .5f, .5f, shade(100)),
-        /* -Y bottom */ FACE(-.5f,-.5f, .5f,  .5f,-.5f, .5f,  .5f,-.5f,-.5f, -.5f,-.5f,-.5f, shade(50)),
-        /* -Z north  */ FACE( .5f, .5f,-.5f, -.5f, .5f,-.5f, -.5f,-.5f,-.5f,  .5f,-.5f,-.5f, shade(80)),
-        /* +Z south  */ FACE(-.5f, .5f, .5f,  .5f, .5f, .5f,  .5f,-.5f, .5f, -.5f,-.5f, .5f, shade(80)),
-        /* -X west   */ FACE(-.5f, .5f,-.5f, -.5f, .5f, .5f, -.5f,-.5f, .5f, -.5f,-.5f,-.5f, shade(60)),
-        /* +X east   */ FACE( .5f, .5f, .5f,  .5f, .5f,-.5f,  .5f,-.5f,-.5f,  .5f,-.5f, .5f, shade(60)),
-    };
-    memcpy(g_cube, cube, sizeof cube);
+    for (int z = 0; z < CHUNK; z++)
+        for (int x = 0; x < CHUNK; x++) {
+            int h = 6 + (int)(3.5f * sinf(x * 0.35f) * cosf(z * 0.28f)
+                            + 2.0f * sinf((x + z) * 0.2f));
+            if (h < 1) h = 1;
+            if (h > 14) h = 14;
+            for (int y = 0; y < h; y++) {
+                if      (y == h - 1) g_blocks[y][z][x] = B_GRASS;
+                else if (y >= h - 4) g_blocks[y][z][x] = B_DIRT;
+                else                 g_blocks[y][z][x] = B_STONE;
+            }
+        }
+}
+
+/* ------------------------------------------------------------- meshing --- */
+/* Per-face data. Corner order (a,b,c,d) keeps the winding proven in M1:
+ * a=uv(0,0) b=uv(1,0) c=uv(1,1) d=uv(0,1); triangles abc + acd, CULL_CW. */
+
+static const struct {
+    int dx, dy, dz;          /* neighbor offset */
+    float c[4][3];           /* corner offsets a,b,c,d */
+    int shade;               /* Minecraft-ish face light, percent */
+} FACES[6] = {
+    [F_TOP]    = { 0, 1, 0, {{0,1,0},{1,1,0},{1,1,1},{0,1,1}}, 100 },
+    [F_BOTTOM] = { 0,-1, 0, {{0,0,1},{1,0,1},{1,0,0},{0,0,0}},  50 },
+    [F_NORTH]  = { 0, 0,-1, {{1,1,0},{0,1,0},{0,0,0},{1,0,0}},  80 },
+    [F_SOUTH]  = { 0, 0, 1, {{0,1,1},{1,1,1},{1,0,1},{0,0,1}},  80 },
+    [F_WEST]   = {-1, 0, 0, {{0,1,0},{0,1,1},{0,0,1},{0,0,0}},  60 },
+    [F_EAST]   = { 1, 0, 0, {{1,1,1},{1,1,0},{1,0,0},{1,0,1}},  60 },
+};
+
+static const BYTE TILE_FOR[4][6] = {   /* [block][face] -> atlas tile */
+    [B_GRASS] = { T_GRASS_TOP, T_DIRT, T_GRASS_SIDE, T_GRASS_SIDE,
+                  T_GRASS_SIDE, T_GRASS_SIDE },
+    [B_DIRT]  = { T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT },
+    [B_STONE] = { T_STONE, T_STONE, T_STONE, T_STONE, T_STONE, T_STONE },
+};
+
+static VTX *emit_face(VTX *v, int x, int y, int z, int f, int tile)
+{
+    int s = 255 * FACES[f].shade / 100;
+    DWORD col = D3DCOLOR_XRGB(s, s, s);
+    float u0 = tile * USTEP, u1 = u0 + USTEP;
+    VTX q[4];
+    for (int i = 0; i < 4; i++) {
+        q[i].x = x + FACES[f].c[i][0];
+        q[i].y = y + FACES[f].c[i][1];
+        q[i].z = z + FACES[f].c[i][2];
+        q[i].color = col;
+    }
+    q[0].u = u0; q[0].v = 0;
+    q[1].u = u1; q[1].v = 0;
+    q[2].u = u1; q[2].v = 1;
+    q[3].u = u0; q[3].v = 1;
+    *v++ = q[0]; *v++ = q[1]; *v++ = q[2];
+    *v++ = q[0]; *v++ = q[2]; *v++ = q[3];
+    return v;
+}
+
+static int build_mesh(void)
+{
+    LARGE_INTEGER freq, a, b;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&a);
+
+    /* worst case: every block, all 6 faces */
+    VTX *buf = malloc(sizeof(VTX) * CHUNK * CHUNK * CHUNK * 36);
+    if (!buf) return 0;
+    VTX *v = buf;
+
+    for (int y = 0; y < CHUNK; y++)
+        for (int z = 0; z < CHUNK; z++)
+            for (int x = 0; x < CHUNK; x++) {
+                int blk = g_blocks[y][z][x];
+                if (blk == B_AIR) continue;
+                for (int f = 0; f < 6; f++)
+                    if (block_at(x + FACES[f].dx, y + FACES[f].dy,
+                                 z + FACES[f].dz) == B_AIR)
+                        v = emit_face(v, x, y, z, f, TILE_FOR[blk][f]);
+            }
+
+    int nverts = (int)(v - buf);
+    g_ntris = nverts / 3;
+
+    UINT bytes = nverts * sizeof(VTX);
+    if (FAILED(IDirect3DDevice9_CreateVertexBuffer(g_dev, bytes,
+                   D3DUSAGE_WRITEONLY, VTX_FVF, D3DPOOL_MANAGED, &g_vb, NULL))) {
+        free(buf);
+        return 0;
+    }
+    void *dst;
+    if (FAILED(IDirect3DVertexBuffer9_Lock(g_vb, 0, bytes, &dst, 0))) {
+        free(buf);
+        return 0;
+    }
+    memcpy(dst, buf, bytes);
+    IDirect3DVertexBuffer9_Unlock(g_vb);
+    free(buf);
+
+    QueryPerformanceCounter(&b);
+    g_mesh_ms = (int)((b.QuadPart - a.QuadPart) * 1000 / freq.QuadPart);
+    return 1;
 }
 
 /* ------------------------------------------------------------- texture --- */
-/* Procedural dirt block with a mossy top edge — no asset files to deploy. */
+/* 256x64 atlas, 4 procedural tiles: grass-top, grass-side, dirt, stone. */
 
 static unsigned g_rng = 0x12345678u;
 static unsigned rng(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng >> 16; }
 
-static int make_texture(void)
+static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
 {
-    if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TEX_SIZE, TEX_SIZE, 1, 0,
+    int n;
+    switch (tile) {
+    case T_GRASS_TOP:
+        n = (int)(rng() % 50);
+        *r = 60 + n / 3; *g = 130 + n; *b = 50 + n / 3;
+        break;
+    case T_GRASS_SIDE:
+        n = (int)(rng() % 40);
+        *r = 134 + n - 20; *g = 96 + n - 20; *b = 67 + n - 20;
+        if (y < 8) {                       /* green band along the top */
+            int gn = (int)(rng() % 50);
+            *r = 60 + gn / 3; *g = 140 + gn; *b = 50 + gn / 3;
+        }
+        break;
+    case T_DIRT:
+        n = (int)(rng() % 40);
+        *r = 134 + n - 20; *g = 96 + n - 20; *b = 67 + n - 20;
+        break;
+    default:                               /* T_STONE */
+        n = (int)(rng() % 35);
+        *r = *g = *b = 110 + n - 17;
+        break;
+    }
+    if (x == 0 || y == 0) { *r -= 25; *g -= 25; *b -= 25; }   /* block edge */
+}
+
+static int make_atlas(void)
+{
+    if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TILE * NTILES, TILE, 1, 0,
                                               D3DFMT_X8R8G8B8, D3DPOOL_MANAGED,
                                               &g_tex, NULL)))
         return 0;
 
     D3DLOCKED_RECT lr;
     if (FAILED(IDirect3DTexture9_LockRect(g_tex, 0, &lr, NULL, 0))) return 0;
-    for (int y = 0; y < TEX_SIZE; y++) {
+    for (int y = 0; y < TILE; y++) {
         DWORD *row = (DWORD *)((BYTE *)lr.pBits + y * lr.Pitch);
-        for (int x = 0; x < TEX_SIZE; x++) {
-            int n = (int)(rng() % 40);                 /* dirt speckle */
-            int rr = 134 + n - 20, gg = 96 + n - 20, bb = 67 + n - 20;
-            if (y < 8) {                               /* mossy top band */
-                int gn = (int)(rng() % 50);
-                rr = 60 + gn / 3; gg = 140 + gn; bb = 50 + gn / 3;
+        for (int t = 0; t < NTILES; t++)
+            for (int x = 0; x < TILE; x++) {
+                int r, g, b;
+                tile_pixel(t, x, y, &r, &g, &b);
+                row[t * TILE + x] = D3DCOLOR_XRGB(r & 0xFF, g & 0xFF, b & 0xFF);
             }
-            if (x == 0 || y == 0) { rr -= 25; gg -= 25; bb -= 25; } /* block edge */
-            row[x] = D3DCOLOR_XRGB(rr & 0xFF, gg & 0xFF, bb & 0xFF);
-        }
     }
     IDirect3DTexture9_UnlockRect(g_tex, 0);
     return 1;
@@ -164,22 +287,33 @@ static int make_texture(void)
 
 static int g_mouse_reset = 1;   /* skip the delta on the first focused frame */
 
-static void update_camera(float dt)
+static void update_camera(float dt, float t)
 {
+    float cx = CHUNK / 2.0f, cy = CHUNK / 2.0f, cz = CHUNK / 2.0f;
+
+    if (!g_manual) {
+        /* slow orbit around the chunk, looking at its center */
+        float a = t * 0.25f, r = 22.0f, h = 12.0f;
+        g_cam_x = cx + sinf(a) * r;
+        g_cam_z = cz + cosf(a) * r;
+        g_cam_y = cy + h;
+        g_yaw   = a + 3.14159265f;
+        g_pitch = atan2f(h, r);
+    }
+
     if (GetFocus() != g_hwnd) { g_mouse_reset = 1; return; }
 
-    float speed = 5.0f * dt;
-    float fx = sinf(g_yaw), fz = cosf(g_yaw);   /* forward (horizontal) */
-    float rx = cosf(g_yaw), rz = -sinf(g_yaw);  /* right */
+    float speed = 8.0f * dt;
+    float fx = sinf(g_yaw), fz = cosf(g_yaw);
+    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
 
-    if (GetAsyncKeyState('W') & 0x8000) { g_cam_x += fx * speed; g_cam_z += fz * speed; }
-    if (GetAsyncKeyState('S') & 0x8000) { g_cam_x -= fx * speed; g_cam_z -= fz * speed; }
-    if (GetAsyncKeyState('D') & 0x8000) { g_cam_x += rx * speed; g_cam_z += rz * speed; }
-    if (GetAsyncKeyState('A') & 0x8000) { g_cam_x -= rx * speed; g_cam_z -= rz * speed; }
-    if (GetAsyncKeyState('E') & 0x8000) g_cam_y += speed;
-    if (GetAsyncKeyState('Q') & 0x8000) g_cam_y -= speed;
+    if (GetAsyncKeyState('W') & 0x8000) { g_manual = 1; g_cam_x += fx * speed; g_cam_z += fz * speed; }
+    if (GetAsyncKeyState('S') & 0x8000) { g_manual = 1; g_cam_x -= fx * speed; g_cam_z -= fz * speed; }
+    if (GetAsyncKeyState('D') & 0x8000) { g_manual = 1; g_cam_x += rx * speed; g_cam_z += rz * speed; }
+    if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_cam_x -= rx * speed; g_cam_z -= rz * speed; }
+    if (GetAsyncKeyState('E') & 0x8000) { g_manual = 1; g_cam_y += speed; }
+    if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_cam_y -= speed; }
 
-    /* mouse-look: delta from window center, then recenter the cursor */
     POINT center = { WIN_W / 2, WIN_H / 2 }, p;
     ClientToScreen(g_hwnd, &center);
     GetCursorPos(&p);
@@ -188,10 +322,12 @@ static void update_camera(float dt)
         SetCursorPos(center.x, center.y);
         return;
     }
-    g_yaw   += (p.x - center.x) * 0.003f;
-    g_pitch += (p.y - center.y) * 0.003f;
-    if (g_pitch >  1.55f) g_pitch =  1.55f;
-    if (g_pitch < -1.55f) g_pitch = -1.55f;
+    if (g_manual) {
+        g_yaw   += (p.x - center.x) * 0.003f;
+        g_pitch += (p.y - center.y) * 0.003f;
+        if (g_pitch >  1.55f) g_pitch =  1.55f;
+        if (g_pitch < -1.55f) g_pitch = -1.55f;
+    }
     SetCursorPos(center.x, center.y);
 }
 
@@ -232,29 +368,28 @@ static int init_d3d(HWND hwnd)
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_LIGHTING, FALSE);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_TRUE);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_CULLMODE, D3DCULL_CW);
-    /* point sampling = the Minecraft look, and the cheapest filter there is */
     IDirect3DDevice9_SetSamplerState(g_dev, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     IDirect3DDevice9_SetSamplerState(g_dev, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 
     D3DMATRIX proj = mat_perspective(1.22f /* ~70 deg */,
                                      (float)WIN_W / WIN_H, 0.1f, 100.0f);
     IDirect3DDevice9_SetTransform(g_dev, D3DTS_PROJECTION, &proj);
-    return make_texture();
+    return make_atlas();
 }
 
-static void render_frame(float t)
+static void render_frame(void)
 {
     IDirect3DDevice9_Clear(g_dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
                            D3DCOLOR_XRGB(0x87, 0xCE, 0xEB), 1.0f, 0);
     if (SUCCEEDED(IDirect3DDevice9_BeginScene(g_dev))) {
-        D3DMATRIX spin = mat_rot_y(t * 0.7f);
-        D3DMATRIX view = mat_view();
-        IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &spin);
+        D3DMATRIX world = mat_identity();
+        D3DMATRIX view  = mat_view();
+        IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &world);
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_VIEW, &view);
         IDirect3DDevice9_SetTexture(g_dev, 0, (IDirect3DBaseTexture9 *)g_tex);
         IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
-        IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, 12,
-                                         g_cube, sizeof(VTX));
+        IDirect3DDevice9_SetStreamSource(g_dev, 0, g_vb, 0, sizeof(VTX));
+        IDirect3DDevice9_DrawPrimitive(g_dev, D3DPT_TRIANGLELIST, 0, g_ntris);
         IDirect3DDevice9_EndScene(g_dev);
     }
 
@@ -285,14 +420,17 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         MessageBoxA(NULL, "D3D9 init failed", "xp-craft", MB_ICONERROR);
         return 1;
     }
-    build_cube();
+    gen_terrain();
+    if (!build_mesh()) {
+        MessageBoxA(NULL, "mesh build failed", "xp-craft", MB_ICONERROR);
+        return 1;
+    }
     ShowWindow(g_hwnd, show);
 
-    LARGE_INTEGER freq, start, t0, now;
+    LARGE_INTEGER freq, start, t0, now, prev_t;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
-    t0 = start;
-    LARGE_INTEGER prev_t = start;
+    t0 = prev_t = start;
     int frames = 0;
 
     while (g_running) {
@@ -307,20 +445,22 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         float t  = (float)((double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart);
         prev_t = now;
 
-        update_camera(dt);
-        render_frame(t);
+        update_camera(dt, t);
+        render_frame();
         frames++;
 
         double sec = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
         if (sec >= 1.0) {
-            char title[64];
-            sprintf(title, "xp-craft - %.0f FPS", frames / sec);
+            char title[96];
+            sprintf(title, "xp-craft - %.0f FPS - %d tris (mesh %d ms)",
+                    frames / sec, g_ntris, g_mesh_ms);
             SetWindowTextA(g_hwnd, title);
             frames = 0;
             t0 = now;
         }
     }
 
+    if (g_vb)  IDirect3DVertexBuffer9_Release(g_vb);
     if (g_tex) IDirect3DTexture9_Release(g_tex);
     if (g_dev) IDirect3DDevice9_Release(g_dev);
     if (g_d3d) IDirect3D9_Release(g_d3d);
