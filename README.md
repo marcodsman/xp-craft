@@ -59,27 +59,40 @@ and just fails fast when away).
 Tick these off as they land. Ordered so the game is playable-feeling early and
 world-rich later; every step gets measured on the box before it counts.
 
-**Phase A — feels like a game**
-- [x] A1. Gravity, jumping, block collision (walk mode; F / double-tap CROSS toggles fly;
-      CROSS/SPACE jumps; axis-separated AABB vs blocks, 0.6x1.8 player box, no
-      measurable FPS cost)
-- [ ] A2. Hotbar UI with block icons + selection highlight (kill the title-bar readout)
-- [ ] A3. Day/night cycle (~10 min loop: sky + fog color + light-level shading)
-- [ ] A4. Sounds: dig/place/footsteps/jump (waveOut, tiny generated WAVs)
+**Phase A — feels like a game** (all landed overnight 2026-07-05)
+- [x] A1. Gravity, jumping, block collision (walk mode; F / double-tap CROSS toggles fly)
+- [x] A2. Hotbar UI: 8 block tiles, selection frame + name label; keys 1-8, SQUARE/L1/R1
+      or mouse wheel cycle
+- [x] A3. Day/night: 20-min loop, sky+fog lerp, world dimmed via TEXTUREFACTOR stage;
+      clock in the stats line (tod 0 = 06:00 so the label matches the light)
+- [x] A4. Sounds: dig/place/step/jump generated at startup, 4 waveOut voices (kernel
+      mixer blends), `volume=N` arg, muted in bench. (Code-verified; audible check
+      needs ears at the box.)
 
-**Phase B — a world worth exploring**
-- [ ] B1. Value-noise terrain with octaves (replace the layered sines)
-- [ ] B2. Taller world (raise WORLD_H past 16 — mesher masks are sized CHUNK*CHUNK,
-      must grow with it)
-- [ ] B3. Trees + wood/leaves/sand block types
-- [ ] B4. Water: translucent, non-solid, swimmable-ish (render pass after opaque)
-- [ ] B5. Caves (3D noise carve) + stone variety underground
+**Phase B — a world worth exploring** (verified by screenshot + world.dat forensics)
+- [x] B1. Value-noise fBm terrain (continents + hills octaves)
+- [x] B2. World is now 512x512x64 (32x32 chunk columns)
+- [x] B3. ~2,900 trees (log trunks, ragged leaf canopies), sand beaches near water
+- [x] B4. Translucent water lakes (second render pass, no z-write, alpha 160; raycast
+      passes through; swim-ish physics: buoyant sink, CROSS paddles up)
+- [x] B5. 3D-noise caves (8k+ sampled underground air cells), coal veins (190k blocks)
+      and cobble patches in the stone
 
 **Phase C — polish**
-- [ ] C1. Fullscreen at native 1366x768 + pause menu (CIRCLE/ESC: resume/save/quit)
-- [ ] C2. Async chunk remesh (edits already 4 ms; matters once the world grows)
-- [ ] C3. Bigger world / chunk streaming from disk
-- [ ] C4. Save versioning + player position saved with the world
+- [x] C1. Borderless fullscreen at desktop res (`windowed` arg for a window) + pause
+      menu (ESC/START: resume / save / quit) + GDI-rendered font atlas for all text
+- [x] C2. Meshing runs on a worker thread; edits re-queue at high priority
+- [x] C3. Chunks stream in on demand (nearest-first), VBs evict beyond range+80;
+      whole world stays in RAM (16 MB), save is one 16 MB blob
+- [x] C4. Save v2: dims-validated header + player pos/look/mode/hotbar + time of day;
+      autosave every 3 min; `world-v1.bak` kept from the old format
+
+**Bench, new world (800x600 windowed):** r=32 → 43 FPS, r=48 → 33, r=64 → 25,
+r=96 → 17, r=128 → 11. Default range 48. The forest costs ~3x the old flat world's
+triangles — leaves defeat greedy meshing by design (ragged corners).
+
+**Dev args:** `windowed`, `bench`, `time=0..1` (freeze time of day), `volume=0..100`,
+`at=x,z` (teleport, flying).
 
 **Phase D — dreams**
 - [ ] D1. LAN multiplayer (the laptop joins the den as player 2)
