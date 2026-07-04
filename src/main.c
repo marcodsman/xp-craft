@@ -1,4 +1,11 @@
-/* xp-craft milestone 3 — chunk grid + frustum culling + greedy meshing.
+/* xp-craft milestone 4 — break/place blocks, raycast picking, save/load.
+ *
+ * On top of the M3 chunk-grid renderer: Amanatides-Woo voxel raycast from
+ * the crosshair (reach 6), LMB breaks / RMB places with hold-repeat, edits
+ * rebuild the touched chunk (+ neighbor if on a border) synchronously,
+ * targeted block gets a wireframe highlight. Keys 1-4 pick grass/dirt/
+ * stone/planks. World persists to world.dat next to the exe: loaded at
+ * startup, saved on exit and on F5. y=0 is bedrock (unbreakable).
  *
  * 20x20 chunks (320x320x16 blocks). Each chunk greedy-meshes into one
  * indexed vertex buffer with draw ranges grouped by texture (4 separate
@@ -34,15 +41,16 @@
 #define WZ (WORLD_CZ * CHUNK)
 
 #define TILE 64                     /* texture size in pixels */
-#define NTILES 4
+#define NTILES 5
+#define REACH 6.0f                  /* block interaction distance */
 
 /* worst case emitted quads per chunk = 3D checkerboard: half the blocks
  * solid, all 6 faces each */
 #define MAX_QUADS (CHUNK * CHUNK * CHUNK / 2 * 6)
 
-enum { B_AIR, B_GRASS, B_DIRT, B_STONE };
+enum { B_AIR, B_GRASS, B_DIRT, B_STONE, B_PLANKS, NBLOCKS };
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
-enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE };
+enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE, T_PLANKS };
 
 typedef struct { float x, y, z; DWORD color; float u, v; } VTX;
 #define VTX_FVF (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
@@ -74,6 +82,14 @@ static const DWORD FOG_COLOR = D3DCOLOR_XRGB(0x87, 0xCE, 0xEB);
 static float g_cam_x, g_cam_y, g_cam_z;
 static float g_yaw, g_pitch;
 static int   g_manual;
+
+/* block editing */
+static int   g_sel = B_PLANKS;      /* block type to place (keys 1-4) */
+static int   g_remesh_ms;           /* last edit's rebuild cost */
+static float g_click_cd;            /* hold-repeat cooldown */
+static char  g_world_file[MAX_PATH];
+static const char *BLOCK_NAME[NBLOCKS] =
+    { "air", "grass", "dirt", "stone", "planks" };
 
 /* bench mode */
 static int    g_bench;
@@ -234,11 +250,13 @@ static const struct {
     [F_EAST]   = { 1, 0, 0, {{1,1,1},{1,1,0},{1,0,0},{1,0,1}},  60 },
 };
 
-static const BYTE TILE_FOR[4][6] = {
-    [B_GRASS] = { T_GRASS_TOP, T_DIRT, T_GRASS_SIDE, T_GRASS_SIDE,
-                  T_GRASS_SIDE, T_GRASS_SIDE },
-    [B_DIRT]  = { T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT },
-    [B_STONE] = { T_STONE, T_STONE, T_STONE, T_STONE, T_STONE, T_STONE },
+static const BYTE TILE_FOR[NBLOCKS][6] = {
+    [B_GRASS]  = { T_GRASS_TOP, T_DIRT, T_GRASS_SIDE, T_GRASS_SIDE,
+                   T_GRASS_SIDE, T_GRASS_SIDE },
+    [B_DIRT]   = { T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT },
+    [B_STONE]  = { T_STONE, T_STONE, T_STONE, T_STONE, T_STONE, T_STONE },
+    [B_PLANKS] = { T_PLANKS, T_PLANKS, T_PLANKS, T_PLANKS,
+                   T_PLANKS, T_PLANKS },
 };
 
 typedef struct { BYTE tile, face; BYTE x0, x1, y0, y1, z0, z1; } QUAD;
@@ -456,6 +474,136 @@ static int build_world_meshes(void)
     return 1;
 }
 
+/* ------------------------------------------------------- editing (M4) ---- */
+
+static void rebuild_chunk(int cx, int cz)
+{
+    if (cx < 0 || cz < 0 || cx >= WORLD_CX || cz >= WORLD_CZ) return;
+    CHUNKMESH *c = &g_chunks[cz][cx];
+    g_world_tris -= c->ntris;
+    if (c->vb) { IDirect3DVertexBuffer9_Release(c->vb); c->vb = NULL; }
+    if (c->ib) { IDirect3DIndexBuffer9_Release(c->ib); c->ib = NULL; }
+    build_chunk(cx, cz);
+}
+
+static void set_block(int x, int y, int z, int b)
+{
+    if (x < 0 || y < 1 || z < 0 || x >= WX || y >= WORLD_H || z >= WZ)
+        return;                     /* y=0 is bedrock */
+    g_world[y][z][x] = (BYTE)b;
+
+    LARGE_INTEGER freq, a, e;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&a);
+    int cx = x / CHUNK, cz = z / CHUNK;
+    rebuild_chunk(cx, cz);
+    if (x % CHUNK == 0)         rebuild_chunk(cx - 1, cz);
+    if (x % CHUNK == CHUNK - 1) rebuild_chunk(cx + 1, cz);
+    if (z % CHUNK == 0)         rebuild_chunk(cx, cz - 1);
+    if (z % CHUNK == CHUNK - 1) rebuild_chunk(cx, cz + 1);
+    QueryPerformanceCounter(&e);
+    g_remesh_ms = (int)((e.QuadPart - a.QuadPart) * 1000 / freq.QuadPart);
+}
+
+static void cam_dir(float *dx, float *dy, float *dz)
+{
+    *dx = sinf(g_yaw) * cosf(g_pitch);
+    *dy = -sinf(g_pitch);
+    *dz = cosf(g_yaw) * cosf(g_pitch);
+}
+
+/* Amanatides-Woo voxel traversal from the eye along the view direction.
+ * Returns 1 on hit; hit[] = solid cell, prev[] = last empty cell before it. */
+static int raycast(int hit[3], int prev[3])
+{
+    float dx, dy, dz;
+    cam_dir(&dx, &dy, &dz);
+
+    int   cx = (int)floorf(g_cam_x), cy = (int)floorf(g_cam_y),
+          cz = (int)floorf(g_cam_z);
+    int   sx = dx >= 0 ? 1 : -1, sy = dy >= 0 ? 1 : -1, sz = dz >= 0 ? 1 : -1;
+    float tdx = dx != 0 ? fabsf(1.0f / dx) : 1e30f;
+    float tdy = dy != 0 ? fabsf(1.0f / dy) : 1e30f;
+    float tdz = dz != 0 ? fabsf(1.0f / dz) : 1e30f;
+    float tmx = dx != 0 ? (dx > 0 ? (cx + 1 - g_cam_x) : (g_cam_x - cx)) * tdx : 1e30f;
+    float tmy = dy != 0 ? (dy > 0 ? (cy + 1 - g_cam_y) : (g_cam_y - cy)) * tdy : 1e30f;
+    float tmz = dz != 0 ? (dz > 0 ? (cz + 1 - g_cam_z) : (g_cam_z - cz)) * tdz : 1e30f;
+
+    prev[0] = cx; prev[1] = cy; prev[2] = cz;
+    float t = 0;
+    while (t <= REACH) {
+        prev[0] = cx; prev[1] = cy; prev[2] = cz;
+        if      (tmx <= tmy && tmx <= tmz) { t = tmx; tmx += tdx; cx += sx; }
+        else if (tmy <= tmz)               { t = tmy; tmy += tdy; cy += sy; }
+        else                               { t = tmz; tmz += tdz; cz += sz; }
+        if (t > REACH) break;
+        if (block_at(cx, cy, cz) != B_AIR) {
+            hit[0] = cx; hit[1] = cy; hit[2] = cz;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void edit_break(void)
+{
+    int hit[3], prev[3];
+    if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H)
+        set_block(hit[0], hit[1], hit[2], B_AIR);
+}
+
+static void edit_place(void)
+{
+    int hit[3], prev[3];
+    if (!raycast(hit, prev)) return;
+    if (block_at(prev[0], prev[1], prev[2]) != B_AIR) return;
+    /* don't build inside the camera */
+    int ex = (int)floorf(g_cam_x), ey = (int)floorf(g_cam_y),
+        ez = (int)floorf(g_cam_z);
+    if (prev[0] == ex && prev[2] == ez &&
+        (prev[1] == ey || prev[1] == ey - 1))
+        return;
+    set_block(prev[0], prev[1], prev[2], g_sel);
+}
+
+/* --------------------------------------------------------- save / load --- */
+
+static void world_file_path(void)
+{
+    GetModuleFileNameA(NULL, g_world_file, MAX_PATH);
+    char *s = strrchr(g_world_file, '\\');
+    if (s) strcpy(s + 1, "world.dat");
+    else   strcpy(g_world_file, "world.dat");
+}
+
+static void save_world(void)
+{
+    FILE *fp = fopen(g_world_file, "wb");
+    if (!fp) return;
+    int hdr[4] = { 0x31435058 /* "XPC1" */, WX, WZ, WORLD_H };
+    fwrite(hdr, sizeof hdr, 1, fp);
+    fwrite(g_world, sizeof(BYTE) * WORLD_H * WZ * WX, 1, fp);
+    fclose(fp);
+}
+
+static int load_world(void)
+{
+    FILE *fp = fopen(g_world_file, "rb");
+    if (!fp) return 0;
+    int hdr[4] = {0};
+    if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
+        hdr[0] != 0x31435058 || hdr[1] != WX || hdr[2] != WZ ||
+        hdr[3] != WORLD_H) {
+        fclose(fp);
+        return 0;
+    }
+    g_world = calloc(1, sizeof(BYTE) * WORLD_H * WZ * WX);
+    size_t ok = fread(g_world, sizeof(BYTE) * WORLD_H * WZ * WX, 1, fp);
+    fclose(fp);
+    if (ok != 1) { free(g_world); g_world = NULL; return 0; }
+    return 1;
+}
+
 /* ------------------------------------------------------------- texture --- */
 
 static unsigned g_rng = 0x12345678u;
@@ -480,6 +628,12 @@ static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
     case T_DIRT:
         n = (int)(rng() % 40);
         *r = 134 + n - 20; *g = 96 + n - 20; *b = 67 + n - 20;
+        break;
+    case T_PLANKS:
+        n = (int)(rng() % 24);
+        *r = 168 + n - 12; *g = 130 + n - 12; *b = 78 + n - 12;
+        if (y % 16 == 15) { *r -= 45; *g -= 40; *b -= 30; }  /* board seams */
+        if ((x + (y / 16) * 23) % 32 == 0) { *r -= 30; *g -= 25; *b -= 20; }
         break;
     default:
         n = (int)(rng() % 35);
@@ -546,6 +700,15 @@ static void update_camera(float dt, float t)
     if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_cam_x -= rx * speed; g_cam_z -= rz * speed; }
     if (GetAsyncKeyState('E') & 0x8000) { g_manual = 1; g_cam_y += speed; }
     if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_cam_y -= speed; }
+
+    /* hold-repeat only; the initial click arrives via WM_L/RBUTTONDOWN */
+    g_click_cd -= dt;
+    int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    int rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    if ((lmb || rmb) && g_click_cd <= 0) {
+        if (lmb) edit_break(); else edit_place();
+        g_click_cd = 0.22f;
+    }
     if (GetAsyncKeyState(VK_OEM_4) & 0x8000) {      /* [ : shrink range */
         if (g_range > 32) { g_range -= 1; apply_range(); }
     }
@@ -576,7 +739,16 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
-    case WM_KEYDOWN: if (w == VK_ESCAPE) DestroyWindow(h); return 0;
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) DestroyWindow(h);
+        else if (w >= '1' && w <= '4') g_sel = (int)(w - '0');
+        else if (w == VK_F5) save_world();
+        return 0;
+    case WM_LBUTTONDOWN:            /* edge-triggered here so even sub-frame
+                                       synthetic clicks (nircmd) register */
+        g_manual = 1; edit_break(); g_click_cd = 0.3f; return 0;
+    case WM_RBUTTONDOWN:
+        g_manual = 1; edit_place(); g_click_cd = 0.3f; return 0;
     case WM_SETFOCUS: ShowCursor(FALSE); return 0;
     case WM_KILLFOCUS: ShowCursor(TRUE); return 0;
     }
@@ -679,6 +851,49 @@ static int render_frame(int *nchunks)
             }
         }
         drawn = nvis;
+
+        /* wireframe highlight on the targeted block */
+        int hit[3], prev[3];
+        if (!g_bench && raycast(hit, prev)) {
+            typedef struct { float x, y, z; DWORD c; } LVTX;
+            float e = 0.004f;
+            float x0 = hit[0] - e, x1 = hit[0] + 1 + e;
+            float y0 = hit[1] - e, y1 = hit[1] + 1 + e;
+            float z0 = hit[2] - e, z1 = hit[2] + 1 + e;
+            DWORD bc = D3DCOLOR_XRGB(20, 20, 20);
+            LVTX ln[24] = {
+                {x0,y0,z0,bc},{x1,y0,z0,bc}, {x1,y0,z0,bc},{x1,y0,z1,bc},
+                {x1,y0,z1,bc},{x0,y0,z1,bc}, {x0,y0,z1,bc},{x0,y0,z0,bc},
+                {x0,y1,z0,bc},{x1,y1,z0,bc}, {x1,y1,z0,bc},{x1,y1,z1,bc},
+                {x1,y1,z1,bc},{x0,y1,z1,bc}, {x0,y1,z1,bc},{x0,y1,z0,bc},
+                {x0,y0,z0,bc},{x0,y1,z0,bc}, {x1,y0,z0,bc},{x1,y1,z0,bc},
+                {x1,y0,z1,bc},{x1,y1,z1,bc}, {x0,y0,z1,bc},{x0,y1,z1,bc},
+            };
+            IDirect3DDevice9_SetTexture(g_dev, 0, NULL);
+            IDirect3DDevice9_SetFVF(g_dev, D3DFVF_XYZ | D3DFVF_DIFFUSE);
+            IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_LINELIST, 12,
+                                             ln, sizeof(LVTX));
+        }
+
+        /* crosshair (screen-space, no depth, no fog) */
+        if (!g_bench) {
+            typedef struct { float x, y, z, rhw; DWORD c; } SVTX;
+            float cx = WIN_W / 2.0f, cy = WIN_H / 2.0f;
+            DWORD cc = D3DCOLOR_ARGB(255, 240, 240, 240);
+            SVTX ch[4] = {
+                { cx - 9, cy, 0, 1, cc }, { cx + 10, cy, 0, 1, cc },
+                { cx, cy - 9, 0, 1, cc }, { cx, cy + 10, 0, 1, cc },
+            };
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_FALSE);
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, FALSE);
+            IDirect3DDevice9_SetTexture(g_dev, 0, NULL);
+            IDirect3DDevice9_SetFVF(g_dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+            IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_LINELIST, 2,
+                                             ch, sizeof(SVTX));
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_TRUE);
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, TRUE);
+        }
+
         IDirect3DDevice9_EndScene(g_dev);
     }
 
@@ -758,7 +973,8 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         MessageBoxA(NULL, "D3D9 init failed", "xp-craft", MB_ICONERROR);
         return 1;
     }
-    gen_world();
+    world_file_path();
+    if (!load_world()) gen_world();
     if (!build_world_meshes()) {
         MessageBoxA(NULL, "mesh build failed", "xp-craft", MB_ICONERROR);
         return 1;
@@ -806,15 +1022,18 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
 
         double sec = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
         if (sec >= 1.0) {
-            char title[128];
-            sprintf(title, "xp-craft - %.0f FPS - r=%.0f - %d tris, %d chunks - %s VP",
+            char title[160];
+            sprintf(title, "xp-craft - %.0f FPS - r=%.0f - %d tris, %d chunks"
+                           " - %s VP - place: %s - remesh %d ms",
                     frames / sec, g_range, tris, nchunks,
-                    g_hwvp ? "HW" : "SW");
+                    g_hwvp ? "HW" : "SW", BLOCK_NAME[g_sel], g_remesh_ms);
             SetWindowTextA(g_hwnd, title);
             frames = 0;
             t0 = now;
         }
     }
+
+    if (!g_bench) save_world();
 
     for (int cz = 0; cz < WORLD_CZ; cz++)
         for (int cx = 0; cx < WORLD_CX; cx++) {

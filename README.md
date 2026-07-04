@@ -46,7 +46,11 @@ and just fails fast when away).
       Greedy = 276 tris/chunk avg (8x under naive). Driver exposes HW T&L and it works.
       Full-world mesh 6.4s (16 ms/chunk) — one-time; make rebuilds async in M4.
       `make bench` runs the scripted benchmark and prints bench.txt from the share.
-- [ ] 4. Block break/place, raycast, save/load
+- [x] 4. Block break/place (LMB/RMB + hold-repeat), Amanatides-Woo raycast picking,
+      wireframe highlight, crosshair, planks block (keys 1-4 select), world save/load
+      (world.dat, F5 + on exit, loaded at startup). Edit remesh: **4 ms**. Verified
+      remotely: placed planks on screen, byte-counted them in world.dat, survived a
+      kill+relaunch, broke one and watched the count drop. y=0 is bedrock.
 - [ ] 5. Terrain gen (value noise), day/night, the game part
 - [ ] Stretch: gamepad support, launch entry in xp-launcher
 
