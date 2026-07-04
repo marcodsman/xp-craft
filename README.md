@@ -40,7 +40,12 @@ and just fails fast when away).
       (16-bit backbuffer test deferred to milestone 3, where fill rate starts to matter)
 - [x] 2. One chunk (16x16x16), naive per-face meshing, texture atlas — **106-108 FPS**,
       2172 tris, meshed in 1 ms, static vertex buffer, orbit camera
-- [ ] 3. Chunk grid + frustum culling + greedy meshing; measure the FPS/view-range curve
+- [x] 3. Chunk grid + frustum culling + greedy meshing + fog + HW T&L + bench mode.
+      **The curve (800x600, 20x20-chunk world, hardware VP):**
+      r=32 → 58 FPS (vsync-ish), r=48 → 52, r=64 → 57, r=96 → 38.5, **r=128 → 29 FPS**.
+      Greedy = 276 tris/chunk avg (8x under naive). Driver exposes HW T&L and it works.
+      Full-world mesh 6.4s (16 ms/chunk) — one-time; make rebuilds async in M4.
+      `make bench` runs the scripted benchmark and prints bench.txt from the share.
 - [ ] 4. Block break/place, raycast, save/load
 - [ ] 5. Terrain gen (value noise), day/night, the game part
 - [ ] Stretch: gamepad support, launch entry in xp-launcher

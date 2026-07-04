@@ -28,10 +28,17 @@ run:
 	~/bin/xprun 'start "" "C:\XP_Share\xp-craft\xp-craft.exe"'
 	sleep 5 && ~/bin/xpshot /tmp/xp-craft-shot.png
 
+# Scripted benchmark: cycles view ranges, writes bench.txt next to the exe
+# (= on the share), which we then read straight from Linux.
+bench:
+	~/bin/xprun 'cd /d C:\XP_Share\xp-craft && start "" xp-craft.exe bench'
+	@echo "benchmark running (~60s)..." && sleep 75
+	cat $(DEPLOY)/bench.txt
+
 kill:
 	-~/bin/xprun 'taskkill /f /im xp-craft.exe' >/dev/null 2>&1
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all deploy run kill clean
+.PHONY: all deploy run bench kill clean

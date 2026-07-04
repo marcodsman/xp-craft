@@ -1,12 +1,19 @@
-/* xp-craft milestone 2 — one chunk (16x16x16), naive meshing, texture atlas.
+/* xp-craft milestone 3 — chunk grid + frustum culling + greedy meshing.
  *
- * Blocks: air/grass/dirt/stone. A face is emitted only when the neighbor is
- * air; the mesh goes into a static write-only vertex buffer built once at
- * startup. Atlas is 4 procedural 64x64 tiles (grass-top, grass-side, dirt,
- * stone) in a 256x64 strip — still zero asset files to deploy.
+ * 20x20 chunks (320x320x16 blocks). Each chunk greedy-meshes into one
+ * indexed vertex buffer with draw ranges grouped by texture (4 separate
+ * 64x64 wrap-addressed textures now — greedy quads need UV tiling, which
+ * an atlas can't do in fixed-function). Chunks are culled by view range,
+ * then by frustum (Gribb-Hartmann planes, AABB p-vertex test). Linear
+ * vertex fog hides the pop at the range edge, Minecraft-style.
  *
- * Camera auto-orbits the chunk (so remote screenshots sweep all angles);
- * first WASD/E/Q press switches to manual fly + mouse-look. ESC quits.
+ * Vertex processing: hardware if the driver reports HW T&L, else software.
+ *
+ * Modes:
+ *   xp-craft.exe          normal: spawn at world center, slow turntable;
+ *                         WASD/E/Q+mouse = manual fly, [ ] = view range, ESC quits
+ *   xp-craft.exe bench    scripted 360-degree pan at eye level, 8s per view
+ *                         range {32,48,64,96,128}, writes bench.txt and exits
  */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -19,10 +26,19 @@
 #define WIN_W 800
 #define WIN_H 600
 
-#define CHUNK 16
-#define TILE  64                    /* atlas tile size in pixels */
+#define CHUNK    16
+#define WORLD_CX 20                 /* chunks along x */
+#define WORLD_CZ 20                 /* chunks along z */
+#define WORLD_H  16                 /* blocks tall (one chunk layer) */
+#define WX (WORLD_CX * CHUNK)       /* world size in blocks */
+#define WZ (WORLD_CZ * CHUNK)
+
+#define TILE 64                     /* texture size in pixels */
 #define NTILES 4
-#define USTEP (1.0f / NTILES)
+
+/* worst case emitted quads per chunk = 3D checkerboard: half the blocks
+ * solid, all 6 faces each */
+#define MAX_QUADS (CHUNK * CHUNK * CHUNK / 2 * 6)
 
 enum { B_AIR, B_GRASS, B_DIRT, B_STONE };
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
@@ -31,22 +47,42 @@ enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE };
 typedef struct { float x, y, z; DWORD color; float u, v; } VTX;
 #define VTX_FVF (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
 
-static IDirect3D9             *g_d3d;
-static IDirect3DDevice9       *g_dev;
-static IDirect3DTexture9      *g_tex;
-static IDirect3DVertexBuffer9 *g_vb;
-static D3DPRESENT_PARAMETERS   g_pp;
+typedef struct {
+    IDirect3DVertexBuffer9 *vb;
+    IDirect3DIndexBuffer9  *ib;
+    int ib_start[NTILES];           /* first index per texture group */
+    int prims[NTILES];              /* triangle count per texture group */
+    int nverts, ntris;
+    float min[3], max[3];           /* AABB for frustum test */
+} CHUNKMESH;
+
+static IDirect3D9        *g_d3d;
+static IDirect3DDevice9  *g_dev;
+static IDirect3DTexture9 *g_tex[NTILES];
+static D3DPRESENT_PARAMETERS g_pp;
+static CHUNKMESH g_chunks[WORLD_CZ][WORLD_CX];
+static BYTE (*g_world)[WZ][WX];     /* [y][z][x], malloc'd */
 static int  g_running = 1;
-static int  g_ntris;
-static int  g_mesh_ms;
+static int  g_hwvp;                 /* 1 = hardware vertex processing */
+static int  g_world_tris, g_mesh_ms;
 static HWND g_hwnd;
 
-static BYTE g_blocks[CHUNK][CHUNK][CHUNK];   /* [y][z][x] */
+static float g_range = 64.0f;       /* view range in blocks */
+static const DWORD FOG_COLOR = D3DCOLOR_XRGB(0x87, 0xCE, 0xEB);
 
-/* fly camera (orbit until first movement key) */
+/* fly camera (turntable until first movement key) */
 static float g_cam_x, g_cam_y, g_cam_z;
 static float g_yaw, g_pitch;
 static int   g_manual;
+
+/* bench mode */
+static int    g_bench;
+static int    g_bench_idx;          /* which range is being measured */
+static int    g_bench_warm;         /* still in warmup second */
+static double g_bench_t0, g_bench_frames;
+static const float BENCH_RANGES[] = { 32, 48, 64, 96, 128 };
+#define NBENCH ((int)(sizeof BENCH_RANGES / sizeof BENCH_RANGES[0]))
+static char   g_bench_log[1024];
 
 /* ---------------------------------------------------------------- mat4 --- */
 /* D3D row-vector convention: v' = v * M, D3DMATRIX.m[row][col]. */
@@ -112,39 +148,83 @@ static D3DMATRIX mat_view(void)
     return mat_mul(&m, &rx);
 }
 
-/* --------------------------------------------------------------- chunk ---- */
+/* ------------------------------------------------------------- frustum --- */
+/* Plane extraction for row-vector clip = v*(view*proj): planes live in the
+ * matrix COLUMNS (Gribb-Hartmann transposed). Inside: ax+by+cz+d >= 0. */
+
+static float g_planes[6][4];
+
+static void frustum_from(const D3DMATRIX *vp)
+{
+    for (int i = 0; i < 4; i++) {
+        g_planes[0][i] = vp->m[i][3] + vp->m[i][0];   /* left   */
+        g_planes[1][i] = vp->m[i][3] - vp->m[i][0];   /* right  */
+        g_planes[2][i] = vp->m[i][3] + vp->m[i][1];   /* bottom */
+        g_planes[3][i] = vp->m[i][3] - vp->m[i][1];   /* top    */
+        g_planes[4][i] = vp->m[i][2];                 /* near (D3D z>=0) */
+        g_planes[5][i] = vp->m[i][3] - vp->m[i][2];   /* far    */
+    }
+}
+
+static int aabb_visible(const float min[3], const float max[3])
+{
+    for (int p = 0; p < 6; p++) {
+        const float *pl = g_planes[p];
+        float x = pl[0] >= 0 ? max[0] : min[0];   /* positive vertex */
+        float y = pl[1] >= 0 ? max[1] : min[1];
+        float z = pl[2] >= 0 ? max[2] : min[2];
+        if (pl[0] * x + pl[1] * y + pl[2] * z + pl[3] < 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* --------------------------------------------------------------- world ---- */
+
+static int terrain_h(int x, int z)
+{
+    float h = 7.0f
+            + 4.0f * sinf(x * 0.055f) * cosf(z * 0.045f)     /* rolling hills */
+            + 3.0f * sinf(x * 0.35f) * cosf(z * 0.28f) * 0.6f /* bumps */
+            + 2.0f * sinf((x + z) * 0.11f);
+    int hi = (int)h;
+    if (hi < 1) hi = 1;
+    if (hi > WORLD_H - 2) hi = WORLD_H - 2;
+    return hi;
+}
 
 static int block_at(int x, int y, int z)
 {
-    if (x < 0 || y < 0 || z < 0 || x >= CHUNK || y >= CHUNK || z >= CHUNK)
-        return B_AIR;
-    return g_blocks[y][z][x];
+    if (y < 0) return B_STONE;      /* solid below the world: no bottom skirt */
+    if (x < 0 || z < 0 || x >= WX || z >= WZ || y >= WORLD_H) return B_AIR;
+    return g_world[y][z][x];
 }
 
-static void gen_terrain(void)
+static void gen_world(void)
 {
-    for (int z = 0; z < CHUNK; z++)
-        for (int x = 0; x < CHUNK; x++) {
-            int h = 6 + (int)(3.5f * sinf(x * 0.35f) * cosf(z * 0.28f)
-                            + 2.0f * sinf((x + z) * 0.2f));
-            if (h < 1) h = 1;
-            if (h > 14) h = 14;
+    g_world = calloc(1, sizeof(BYTE) * WORLD_H * WZ * WX);
+    for (int z = 0; z < WZ; z++)
+        for (int x = 0; x < WX; x++) {
+            int h = terrain_h(x, z);
             for (int y = 0; y < h; y++) {
-                if      (y == h - 1) g_blocks[y][z][x] = B_GRASS;
-                else if (y >= h - 4) g_blocks[y][z][x] = B_DIRT;
-                else                 g_blocks[y][z][x] = B_STONE;
+                if      (y == h - 1) g_world[y][z][x] = B_GRASS;
+                else if (y >= h - 4) g_world[y][z][x] = B_DIRT;
+                else                 g_world[y][z][x] = B_STONE;
             }
         }
 }
 
 /* ------------------------------------------------------------- meshing --- */
-/* Per-face data. Corner order (a,b,c,d) keeps the winding proven in M1:
- * a=uv(0,0) b=uv(1,0) c=uv(1,1) d=uv(0,1); triangles abc + acd, CULL_CW. */
+/* Corner offsets keep the winding proven in M1/M2: a=uv(0,0) b=(w,0) c=(w,h)
+ * d=(0,h), triangles abc+acd, CULL_CW. For a greedy rect spanning inclusive
+ * block bounds [x0..x1][y0..y1][z0..z1], each corner component is: offset 0
+ * -> min bound, offset 1 -> max bound + 1. That one rule works for all six
+ * faces with the same offset table as the naive mesher. */
 
 static const struct {
-    int dx, dy, dz;          /* neighbor offset */
-    float c[4][3];           /* corner offsets a,b,c,d */
-    int shade;               /* Minecraft-ish face light, percent */
+    int dx, dy, dz;
+    BYTE c[4][3];                   /* corner offsets a,b,c,d (0=min,1=max+1) */
+    int shade;
 } FACES[6] = {
     [F_TOP]    = { 0, 1, 0, {{0,1,0},{1,1,0},{1,1,1},{0,1,1}}, 100 },
     [F_BOTTOM] = { 0,-1, 0, {{0,0,1},{1,0,1},{1,0,0},{0,0,0}},  50 },
@@ -154,81 +234,229 @@ static const struct {
     [F_EAST]   = { 1, 0, 0, {{1,1,1},{1,1,0},{1,0,0},{1,0,1}},  60 },
 };
 
-static const BYTE TILE_FOR[4][6] = {   /* [block][face] -> atlas tile */
+static const BYTE TILE_FOR[4][6] = {
     [B_GRASS] = { T_GRASS_TOP, T_DIRT, T_GRASS_SIDE, T_GRASS_SIDE,
                   T_GRASS_SIDE, T_GRASS_SIDE },
     [B_DIRT]  = { T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT, T_DIRT },
     [B_STONE] = { T_STONE, T_STONE, T_STONE, T_STONE, T_STONE, T_STONE },
 };
 
-static VTX *emit_face(VTX *v, int x, int y, int z, int f, int tile)
+typedef struct { BYTE tile, face; BYTE x0, x1, y0, y1, z0, z1; } QUAD;
+static QUAD g_quads[MAX_QUADS];     /* scratch, reused per chunk */
+static int  g_nquads;
+
+/* greedy-rectangle a 2D mask: mask[v][u], dims nu x nv; emit() gets the rect */
+static void greedy_2d(BYTE *mask, int nu, int nv,
+                      void (*emit)(int u0, int v0, int w, int h, int tile,
+                                   void *ctx), void *ctx)
 {
-    int s = 255 * FACES[f].shade / 100;
-    DWORD col = D3DCOLOR_XRGB(s, s, s);
-    float u0 = tile * USTEP, u1 = u0 + USTEP;
-    VTX q[4];
-    for (int i = 0; i < 4; i++) {
-        q[i].x = x + FACES[f].c[i][0];
-        q[i].y = y + FACES[f].c[i][1];
-        q[i].z = z + FACES[f].c[i][2];
-        q[i].color = col;
-    }
-    q[0].u = u0; q[0].v = 0;
-    q[1].u = u1; q[1].v = 0;
-    q[2].u = u1; q[2].v = 1;
-    q[3].u = u0; q[3].v = 1;
-    *v++ = q[0]; *v++ = q[1]; *v++ = q[2];
-    *v++ = q[0]; *v++ = q[2]; *v++ = q[3];
-    return v;
+    for (int v = 0; v < nv; v++)
+        for (int u = 0; u < nu; u++) {
+            int t = mask[v * nu + u];
+            if (!t) continue;
+            int w = 1, h = 1;
+            while (u + w < nu && mask[v * nu + u + w] == t) w++;
+            for (; v + h < nv; h++) {
+                int ok = 1;
+                for (int i = 0; i < w; i++)
+                    if (mask[(v + h) * nu + u + i] != t) { ok = 0; break; }
+                if (!ok) break;
+            }
+            for (int j = 0; j < h; j++)
+                for (int i = 0; i < w; i++)
+                    mask[(v + j) * nu + u + i] = 0;
+            emit(u, v, w, h, t, ctx);
+        }
 }
 
-static int build_mesh(void)
+typedef struct { int face, slice; } EMITCTX;
+
+static void emit_rect(int u0, int v0, int w, int h, int tile, void *vctx)
+{
+    EMITCTX *e = vctx;
+    QUAD *q = &g_quads[g_nquads++];
+    q->tile = (BYTE)tile;
+    q->face = (BYTE)e->face;
+    switch (e->face) {
+    case F_TOP: case F_BOTTOM:      /* mask u=x, v=z, slice=y */
+        q->x0 = u0; q->x1 = u0 + w - 1;
+        q->z0 = v0; q->z1 = v0 + h - 1;
+        q->y0 = q->y1 = e->slice;
+        break;
+    case F_NORTH: case F_SOUTH:     /* mask u=x, v=y, slice=z */
+        q->x0 = u0; q->x1 = u0 + w - 1;
+        q->y0 = v0; q->y1 = v0 + h - 1;
+        q->z0 = q->z1 = e->slice;
+        break;
+    default:                        /* W/E: mask u=z, v=y, slice=x */
+        q->z0 = u0; q->z1 = u0 + w - 1;
+        q->y0 = v0; q->y1 = v0 + h - 1;
+        q->x0 = q->x1 = e->slice;
+    }
+}
+
+/* uv extents (in tiles) for a quad, per face group */
+static void quad_uv_extent(const QUAD *q, int *w, int *h)
+{
+    switch (q->face) {
+    case F_TOP: case F_BOTTOM:
+        *w = q->x1 - q->x0 + 1; *h = q->z1 - q->z0 + 1; break;
+    case F_NORTH: case F_SOUTH:
+        *w = q->x1 - q->x0 + 1; *h = q->y1 - q->y0 + 1; break;
+    default:
+        *w = q->z1 - q->z0 + 1; *h = q->y1 - q->y0 + 1; break;
+    }
+}
+
+static void mesh_chunk_quads(int cx, int cz)
+{
+    static BYTE mask[CHUNK * CHUNK];
+    int bx = cx * CHUNK, bz = cz * CHUNK;
+    g_nquads = 0;
+    EMITCTX e;
+
+    /* TOP/BOTTOM: slice y, mask[z][x] */
+    for (int f = F_TOP; f <= F_BOTTOM; f++)
+        for (int y = 0; y < WORLD_H; y++) {
+            int any = 0;
+            for (int z = 0; z < CHUNK; z++)
+                for (int x = 0; x < CHUNK; x++) {
+                    int blk = g_world[y][bz + z][bx + x];
+                    int t = 0;
+                    if (blk != B_AIR &&
+                        block_at(bx + x, y + FACES[f].dy, bz + z) == B_AIR)
+                        t = TILE_FOR[blk][f] + 1;
+                    mask[z * CHUNK + x] = (BYTE)t;
+                    any |= t;
+                }
+            if (!any) continue;
+            e.face = f; e.slice = y;
+            greedy_2d(mask, CHUNK, CHUNK, emit_rect, &e);
+        }
+
+    /* NORTH/SOUTH: slice z, mask[y][x] */
+    for (int f = F_NORTH; f <= F_SOUTH; f++)
+        for (int z = 0; z < CHUNK; z++) {
+            int any = 0;
+            for (int y = 0; y < WORLD_H; y++)
+                for (int x = 0; x < CHUNK; x++) {
+                    int blk = g_world[y][bz + z][bx + x];
+                    int t = 0;
+                    if (blk != B_AIR &&
+                        block_at(bx + x, y, bz + z + FACES[f].dz) == B_AIR)
+                        t = TILE_FOR[blk][f] + 1;
+                    mask[y * CHUNK + x] = (BYTE)t;
+                    any |= t;
+                }
+            if (!any) continue;
+            e.face = f; e.slice = z;
+            greedy_2d(mask, CHUNK, WORLD_H, emit_rect, &e);
+        }
+
+    /* WEST/EAST: slice x, mask[y][z] */
+    for (int f = F_WEST; f <= F_EAST; f++)
+        for (int x = 0; x < CHUNK; x++) {
+            int any = 0;
+            for (int y = 0; y < WORLD_H; y++)
+                for (int z = 0; z < CHUNK; z++) {
+                    int blk = g_world[y][bz + z][bx + x];
+                    int t = 0;
+                    if (blk != B_AIR &&
+                        block_at(bx + x + FACES[f].dx, y, bz + z) == B_AIR)
+                        t = TILE_FOR[blk][f] + 1;
+                    mask[y * CHUNK + z] = (BYTE)t;
+                    any |= t;
+                }
+            if (!any) continue;
+            e.face = f; e.slice = x;
+            greedy_2d(mask, CHUNK, WORLD_H, emit_rect, &e);
+        }
+}
+
+static int build_chunk(int cx, int cz)
+{
+    CHUNKMESH *c = &g_chunks[cz][cx];
+    int bx = cx * CHUNK, bz = cz * CHUNK;
+
+    mesh_chunk_quads(cx, cz);
+    if (!g_nquads) { c->nverts = c->ntris = 0; return 1; }
+
+    int nverts = g_nquads * 4, nidx = g_nquads * 6;
+    VTX  *verts = malloc(sizeof(VTX) * nverts);
+    WORD *idx   = malloc(sizeof(WORD) * nidx);
+    int vi = 0, ii = 0;
+
+    for (int t = 0; t < NTILES; t++) {
+        c->ib_start[t] = ii;
+        for (int n = 0; n < g_nquads; n++) {
+            const QUAD *q = &g_quads[n];
+            if (q->tile != t + 1) continue;
+            int s = 255 * FACES[q->face].shade / 100;
+            DWORD col = D3DCOLOR_XRGB(s, s, s);
+            int uw, vh;
+            quad_uv_extent(q, &uw, &vh);
+            float uvw[4][2] = { {0,0}, {(float)uw,0},
+                                {(float)uw,(float)vh}, {0,(float)vh} };
+            for (int k = 0; k < 4; k++) {
+                const BYTE *o = FACES[q->face].c[k];
+                verts[vi + k].x = (float)(bx + (o[0] ? q->x1 + 1 : q->x0));
+                verts[vi + k].y = (float)(     (o[1] ? q->y1 + 1 : q->y0));
+                verts[vi + k].z = (float)(bz + (o[2] ? q->z1 + 1 : q->z0));
+                verts[vi + k].color = col;
+                verts[vi + k].u = uvw[k][0];
+                verts[vi + k].v = uvw[k][1];
+            }
+            idx[ii++] = (WORD)(vi);     idx[ii++] = (WORD)(vi + 1);
+            idx[ii++] = (WORD)(vi + 2); idx[ii++] = (WORD)(vi);
+            idx[ii++] = (WORD)(vi + 2); idx[ii++] = (WORD)(vi + 3);
+            vi += 4;
+        }
+        c->prims[t] = (ii - c->ib_start[t]) / 3;
+    }
+    c->nverts = vi;
+    c->ntris  = ii / 3;
+
+    c->min[0] = (float)bx; c->min[1] = 0;              c->min[2] = (float)bz;
+    c->max[0] = (float)(bx + CHUNK);
+    c->max[1] = (float)WORLD_H;
+    c->max[2] = (float)(bz + CHUNK);
+
+    if (FAILED(IDirect3DDevice9_CreateVertexBuffer(g_dev,
+                   vi * sizeof(VTX), D3DUSAGE_WRITEONLY, VTX_FVF,
+                   D3DPOOL_MANAGED, &c->vb, NULL)))
+        return 0;
+    if (FAILED(IDirect3DDevice9_CreateIndexBuffer(g_dev,
+                   ii * sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
+                   D3DPOOL_MANAGED, &c->ib, NULL)))
+        return 0;
+    void *p;
+    IDirect3DVertexBuffer9_Lock(c->vb, 0, vi * sizeof(VTX), &p, 0);
+    memcpy(p, verts, vi * sizeof(VTX));
+    IDirect3DVertexBuffer9_Unlock(c->vb);
+    IDirect3DIndexBuffer9_Lock(c->ib, 0, ii * sizeof(WORD), &p, 0);
+    memcpy(p, idx, ii * sizeof(WORD));
+    IDirect3DIndexBuffer9_Unlock(c->ib);
+
+    free(verts);
+    free(idx);
+    g_world_tris += c->ntris;
+    return 1;
+}
+
+static int build_world_meshes(void)
 {
     LARGE_INTEGER freq, a, b;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&a);
-
-    /* worst case: every block, all 6 faces */
-    VTX *buf = malloc(sizeof(VTX) * CHUNK * CHUNK * CHUNK * 36);
-    if (!buf) return 0;
-    VTX *v = buf;
-
-    for (int y = 0; y < CHUNK; y++)
-        for (int z = 0; z < CHUNK; z++)
-            for (int x = 0; x < CHUNK; x++) {
-                int blk = g_blocks[y][z][x];
-                if (blk == B_AIR) continue;
-                for (int f = 0; f < 6; f++)
-                    if (block_at(x + FACES[f].dx, y + FACES[f].dy,
-                                 z + FACES[f].dz) == B_AIR)
-                        v = emit_face(v, x, y, z, f, TILE_FOR[blk][f]);
-            }
-
-    int nverts = (int)(v - buf);
-    g_ntris = nverts / 3;
-
-    UINT bytes = nverts * sizeof(VTX);
-    if (FAILED(IDirect3DDevice9_CreateVertexBuffer(g_dev, bytes,
-                   D3DUSAGE_WRITEONLY, VTX_FVF, D3DPOOL_MANAGED, &g_vb, NULL))) {
-        free(buf);
-        return 0;
-    }
-    void *dst;
-    if (FAILED(IDirect3DVertexBuffer9_Lock(g_vb, 0, bytes, &dst, 0))) {
-        free(buf);
-        return 0;
-    }
-    memcpy(dst, buf, bytes);
-    IDirect3DVertexBuffer9_Unlock(g_vb);
-    free(buf);
-
+    for (int cz = 0; cz < WORLD_CZ; cz++)
+        for (int cx = 0; cx < WORLD_CX; cx++)
+            if (!build_chunk(cx, cz)) return 0;
     QueryPerformanceCounter(&b);
     g_mesh_ms = (int)((b.QuadPart - a.QuadPart) * 1000 / freq.QuadPart);
     return 1;
 }
 
 /* ------------------------------------------------------------- texture --- */
-/* 256x64 atlas, 4 procedural tiles: grass-top, grass-side, dirt, stone. */
 
 static unsigned g_rng = 0x12345678u;
 static unsigned rng(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng >> 16; }
@@ -244,7 +472,7 @@ static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
     case T_GRASS_SIDE:
         n = (int)(rng() % 40);
         *r = 134 + n - 20; *g = 96 + n - 20; *b = 67 + n - 20;
-        if (y < 8) {                       /* green band along the top */
+        if (y < 8) {
             int gn = (int)(rng() % 50);
             *r = 60 + gn / 3; *g = 140 + gn; *b = 50 + gn / 3;
         }
@@ -253,57 +481,62 @@ static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
         n = (int)(rng() % 40);
         *r = 134 + n - 20; *g = 96 + n - 20; *b = 67 + n - 20;
         break;
-    default:                               /* T_STONE */
+    default:
         n = (int)(rng() % 35);
         *r = *g = *b = 110 + n - 17;
         break;
     }
-    if (x == 0 || y == 0) { *r -= 25; *g -= 25; *b -= 25; }   /* block edge */
+    if (x == 0 || y == 0) { *r -= 25; *g -= 25; *b -= 25; }
 }
 
-static int make_atlas(void)
+static int make_textures(void)
 {
-    if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TILE * NTILES, TILE, 1, 0,
-                                              D3DFMT_X8R8G8B8, D3DPOOL_MANAGED,
-                                              &g_tex, NULL)))
-        return 0;
-
-    D3DLOCKED_RECT lr;
-    if (FAILED(IDirect3DTexture9_LockRect(g_tex, 0, &lr, NULL, 0))) return 0;
-    for (int y = 0; y < TILE; y++) {
-        DWORD *row = (DWORD *)((BYTE *)lr.pBits + y * lr.Pitch);
-        for (int t = 0; t < NTILES; t++)
+    for (int t = 0; t < NTILES; t++) {
+        if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TILE, TILE, 1, 0,
+                       D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, &g_tex[t], NULL)))
+            return 0;
+        D3DLOCKED_RECT lr;
+        if (FAILED(IDirect3DTexture9_LockRect(g_tex[t], 0, &lr, NULL, 0)))
+            return 0;
+        for (int y = 0; y < TILE; y++) {
+            DWORD *row = (DWORD *)((BYTE *)lr.pBits + y * lr.Pitch);
             for (int x = 0; x < TILE; x++) {
                 int r, g, b;
                 tile_pixel(t, x, y, &r, &g, &b);
-                row[t * TILE + x] = D3DCOLOR_XRGB(r & 0xFF, g & 0xFF, b & 0xFF);
+                row[x] = D3DCOLOR_XRGB(r & 0xFF, g & 0xFF, b & 0xFF);
             }
+        }
+        IDirect3DTexture9_UnlockRect(g_tex[t], 0);
     }
-    IDirect3DTexture9_UnlockRect(g_tex, 0);
     return 1;
 }
 
 /* --------------------------------------------------------------- input ---- */
 
-static int g_mouse_reset = 1;   /* skip the delta on the first focused frame */
+static int g_mouse_reset = 1;
+
+static void apply_range(void)
+{
+    float zf = g_range * 1.4f;
+    if (zf < 80) zf = 80;
+    D3DMATRIX proj = mat_perspective(1.22f, (float)WIN_W / WIN_H, 0.3f, zf);
+    IDirect3DDevice9_SetTransform(g_dev, D3DTS_PROJECTION, &proj);
+
+    union { float f; DWORD d; } fs = { g_range * 0.55f }, fe = { g_range * 0.98f };
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGSTART, fs.d);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGEND,   fe.d);
+}
 
 static void update_camera(float dt, float t)
 {
-    float cx = CHUNK / 2.0f, cy = CHUNK / 2.0f, cz = CHUNK / 2.0f;
-
-    if (!g_manual) {
-        /* slow orbit around the chunk, looking at its center */
-        float a = t * 0.25f, r = 22.0f, h = 12.0f;
-        g_cam_x = cx + sinf(a) * r;
-        g_cam_z = cz + cosf(a) * r;
-        g_cam_y = cy + h;
-        g_yaw   = a + 3.14159265f;
-        g_pitch = atan2f(h, r);
+    if (!g_manual && !g_bench) {
+        g_yaw = t * 0.15f;          /* slow turntable at spawn */
+        g_pitch = 0.15f;
     }
 
     if (GetFocus() != g_hwnd) { g_mouse_reset = 1; return; }
 
-    float speed = 8.0f * dt;
+    float speed = 10.0f * dt;
     float fx = sinf(g_yaw), fz = cosf(g_yaw);
     float rx = cosf(g_yaw), rz = -sinf(g_yaw);
 
@@ -313,11 +546,17 @@ static void update_camera(float dt, float t)
     if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_cam_x -= rx * speed; g_cam_z -= rz * speed; }
     if (GetAsyncKeyState('E') & 0x8000) { g_manual = 1; g_cam_y += speed; }
     if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_cam_y -= speed; }
+    if (GetAsyncKeyState(VK_OEM_4) & 0x8000) {      /* [ : shrink range */
+        if (g_range > 32) { g_range -= 1; apply_range(); }
+    }
+    if (GetAsyncKeyState(VK_OEM_6) & 0x8000) {      /* ] : grow range */
+        if (g_range < 192) { g_range += 1; apply_range(); }
+    }
 
     POINT center = { WIN_W / 2, WIN_H / 2 }, p;
     ClientToScreen(g_hwnd, &center);
     GetCursorPos(&p);
-    if (g_mouse_reset) {          /* stale cursor position — don't apply it */
+    if (g_mouse_reset) {
         g_mouse_reset = 0;
         SetCursorPos(center.x, center.y);
         return;
@@ -358,12 +597,25 @@ static int init_d3d(HWND hwnd)
     g_pp.BackBufferFormat      = D3DFMT_UNKNOWN;
     g_pp.EnableAutoDepthStencil = TRUE;
     g_pp.AutoDepthStencilFormat = D3DFMT_D16;
-    g_pp.PresentationInterval  = D3DPRESENT_INTERVAL_IMMEDIATE; /* no vsync: measure */
+    g_pp.PresentationInterval  = D3DPRESENT_INTERVAL_IMMEDIATE;
 
+    D3DCAPS9 caps;
+    DWORD vp = D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+    if (SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, D3DADAPTER_DEFAULT,
+                                           D3DDEVTYPE_HAL, &caps)) &&
+        (caps.DevCaps & D3DDEVCAPS_HWTRANSFORMANDLIGHT)) {
+        vp = D3DCREATE_HARDWARE_VERTEXPROCESSING;
+        g_hwvp = 1;
+    }
     if (FAILED(IDirect3D9_CreateDevice(g_d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
-                                       hwnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING,
-                                       &g_pp, &g_dev)))
-        return 0;
+                                       hwnd, vp, &g_pp, &g_dev))) {
+        if (!g_hwvp) return 0;
+        g_hwvp = 0;                 /* HW T&L claimed but device refused */
+        if (FAILED(IDirect3D9_CreateDevice(g_d3d, D3DADAPTER_DEFAULT,
+                       D3DDEVTYPE_HAL, hwnd,
+                       D3DCREATE_SOFTWARE_VERTEXPROCESSING, &g_pp, &g_dev)))
+            return 0;
+    }
 
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_LIGHTING, FALSE);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_TRUE);
@@ -371,25 +623,62 @@ static int init_d3d(HWND hwnd)
     IDirect3DDevice9_SetSamplerState(g_dev, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     IDirect3DDevice9_SetSamplerState(g_dev, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 
-    D3DMATRIX proj = mat_perspective(1.22f /* ~70 deg */,
-                                     (float)WIN_W / WIN_H, 0.1f, 100.0f);
-    IDirect3DDevice9_SetTransform(g_dev, D3DTS_PROJECTION, &proj);
-    return make_atlas();
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, TRUE);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGCOLOR, FOG_COLOR);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+    apply_range();
+
+    return make_textures();
 }
 
-static void render_frame(void)
+/* returns tris drawn; also counts chunks drawn via *nchunks */
+static int render_frame(int *nchunks)
 {
     IDirect3DDevice9_Clear(g_dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-                           D3DCOLOR_XRGB(0x87, 0xCE, 0xEB), 1.0f, 0);
+                           FOG_COLOR, 1.0f, 0);
+    int tris = 0, drawn = 0;
+
     if (SUCCEEDED(IDirect3DDevice9_BeginScene(g_dev))) {
         D3DMATRIX world = mat_identity();
         D3DMATRIX view  = mat_view();
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &world);
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_VIEW, &view);
-        IDirect3DDevice9_SetTexture(g_dev, 0, (IDirect3DBaseTexture9 *)g_tex);
+
+        D3DMATRIX proj;
+        IDirect3DDevice9_GetTransform(g_dev, D3DTS_PROJECTION, &proj);
+        D3DMATRIX vp = mat_mul(&view, &proj);
+        frustum_from(&vp);
+
+        /* visibility pass: range circle, then frustum */
+        static CHUNKMESH *vis[WORLD_CX * WORLD_CZ];
+        int nvis = 0;
+        float margin = CHUNK * 0.71f;   /* half chunk diagonal */
+        for (int cz = 0; cz < WORLD_CZ; cz++)
+            for (int cx = 0; cx < WORLD_CX; cx++) {
+                CHUNKMESH *c = &g_chunks[cz][cx];
+                if (!c->ntris) continue;
+                float dx = (c->min[0] + CHUNK / 2.0f) - g_cam_x;
+                float dz = (c->min[2] + CHUNK / 2.0f) - g_cam_z;
+                if (sqrtf(dx * dx + dz * dz) > g_range + margin) continue;
+                if (!aabb_visible(c->min, c->max)) continue;
+                vis[nvis++] = c;
+            }
+
         IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
-        IDirect3DDevice9_SetStreamSource(g_dev, 0, g_vb, 0, sizeof(VTX));
-        IDirect3DDevice9_DrawPrimitive(g_dev, D3DPT_TRIANGLELIST, 0, g_ntris);
+        for (int t = 0; t < NTILES; t++) {
+            IDirect3DDevice9_SetTexture(g_dev, 0,
+                                        (IDirect3DBaseTexture9 *)g_tex[t]);
+            for (int i = 0; i < nvis; i++) {
+                CHUNKMESH *c = vis[i];
+                if (!c->prims[t]) continue;
+                IDirect3DDevice9_SetStreamSource(g_dev, 0, c->vb, 0, sizeof(VTX));
+                IDirect3DDevice9_SetIndices(g_dev, c->ib);
+                IDirect3DDevice9_DrawIndexedPrimitive(g_dev, D3DPT_TRIANGLELIST,
+                        0, 0, c->nverts, c->ib_start[t], c->prims[t]);
+                tris += c->prims[t];
+            }
+        }
+        drawn = nvis;
         IDirect3DDevice9_EndScene(g_dev);
     }
 
@@ -397,11 +686,60 @@ static void render_frame(void)
     if (hr == D3DERR_DEVICELOST &&
         IDirect3DDevice9_TestCooperativeLevel(g_dev) == D3DERR_DEVICENOTRESET)
         IDirect3DDevice9_Reset(g_dev, &g_pp);
+
+    if (nchunks) *nchunks = drawn;
+    return tris;
 }
+
+/* --------------------------------------------------------------- bench ---- */
+
+static void bench_start(double now)
+{
+    g_range = BENCH_RANGES[g_bench_idx];
+    apply_range();
+    g_bench_warm = 1;
+    g_bench_t0 = now;
+    g_bench_frames = 0;
+}
+
+/* returns 0 when the whole bench is done */
+static int bench_step(double now, int tris, int nchunks)
+{
+    double el = now - g_bench_t0;
+    if (g_bench_warm) {
+        if (el >= 1.0) { g_bench_warm = 0; g_bench_t0 = now; g_bench_frames = 0; }
+        return 1;
+    }
+    g_bench_frames++;
+    if (el < 8.0) return 1;
+
+    char line[128];
+    sprintf(line, "range=%3.0f  avg_fps=%6.1f  tris=%6d  chunks=%3d\r\n",
+            g_range, g_bench_frames / el, tris, nchunks);
+    strcat(g_bench_log, line);
+
+    if (++g_bench_idx >= NBENCH) {
+        FILE *fp = fopen("bench.txt", "wb");
+        if (fp) {
+            fprintf(fp, "xp-craft M3 bench  %dx%d  vp=%s  world=%dx%d chunks  "
+                        "world_tris=%d  mesh_ms=%d\r\n",
+                    WIN_W, WIN_H, g_hwvp ? "hardware" : "software",
+                    WORLD_CX, WORLD_CZ, g_world_tris, g_mesh_ms);
+            fputs(g_bench_log, fp);
+            fclose(fp);
+        }
+        return 0;
+    }
+    bench_start(now);
+    return 1;
+}
+
+/* ---------------------------------------------------------------- main ---- */
 
 int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
 {
-    (void)prev; (void)cmdline;
+    (void)prev;
+    g_bench = (cmdline && strstr(cmdline, "bench")) ? 1 : 0;
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc   = wnd_proc;
@@ -420,18 +758,27 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         MessageBoxA(NULL, "D3D9 init failed", "xp-craft", MB_ICONERROR);
         return 1;
     }
-    gen_terrain();
-    if (!build_mesh()) {
+    gen_world();
+    if (!build_world_meshes()) {
         MessageBoxA(NULL, "mesh build failed", "xp-craft", MB_ICONERROR);
         return 1;
     }
+
+    /* spawn standing at world center */
+    g_cam_x = WX / 2.0f;
+    g_cam_z = WZ / 2.0f;
+    g_cam_y = terrain_h(WX / 2, WZ / 2) + 1.7f;
+    g_pitch = 0.15f;
+
     ShowWindow(g_hwnd, show);
 
     LARGE_INTEGER freq, start, t0, now, prev_t;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
     t0 = prev_t = start;
-    int frames = 0;
+    int frames = 0, tris = 0, nchunks = 0;
+
+    if (g_bench) bench_start(0.0);
 
     while (g_running) {
         MSG msg;
@@ -442,27 +789,42 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
 
         QueryPerformanceCounter(&now);
         float dt = (float)((double)(now.QuadPart - prev_t.QuadPart) / (double)freq.QuadPart);
-        float t  = (float)((double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart);
+        double td = (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart;
         prev_t = now;
 
-        update_camera(dt, t);
-        render_frame();
+        if (g_bench) {
+            g_yaw = (float)(td * (2.0 * 3.14159265 / 8.0));  /* full pan / 8s */
+            g_pitch = 0.15f;
+        } else {
+            update_camera(dt, (float)td);
+        }
+
+        tris = render_frame(&nchunks);
         frames++;
+
+        if (g_bench && !bench_step(td, tris, nchunks)) break;
 
         double sec = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
         if (sec >= 1.0) {
-            char title[96];
-            sprintf(title, "xp-craft - %.0f FPS - %d tris (mesh %d ms)",
-                    frames / sec, g_ntris, g_mesh_ms);
+            char title[128];
+            sprintf(title, "xp-craft - %.0f FPS - r=%.0f - %d tris, %d chunks - %s VP",
+                    frames / sec, g_range, tris, nchunks,
+                    g_hwvp ? "HW" : "SW");
             SetWindowTextA(g_hwnd, title);
             frames = 0;
             t0 = now;
         }
     }
 
-    if (g_vb)  IDirect3DVertexBuffer9_Release(g_vb);
-    if (g_tex) IDirect3DTexture9_Release(g_tex);
+    for (int cz = 0; cz < WORLD_CZ; cz++)
+        for (int cx = 0; cx < WORLD_CX; cx++) {
+            if (g_chunks[cz][cx].vb) IDirect3DVertexBuffer9_Release(g_chunks[cz][cx].vb);
+            if (g_chunks[cz][cx].ib) IDirect3DIndexBuffer9_Release(g_chunks[cz][cx].ib);
+        }
+    for (int t = 0; t < NTILES; t++)
+        if (g_tex[t]) IDirect3DTexture9_Release(g_tex[t]);
     if (g_dev) IDirect3DDevice9_Release(g_dev);
     if (g_d3d) IDirect3D9_Release(g_d3d);
+    free(g_world);
     return 0;
 }
