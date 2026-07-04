@@ -51,11 +51,39 @@ and just fails fast when away).
       (world.dat, F5 + on exit, loaded at startup). Edit remesh: **4 ms**. Verified
       remotely: placed planks on screen, byte-counted them in world.dat, survived a
       kill+relaunch, broke one and watched the count drop. y=0 is bedrock.
-- [ ] 5. Terrain gen (value noise), day/night, the game part
-- [x] Stretch: gamepad support (WinMM, verified with the real pad: stick move/look,
-      POV-hat move, btn1 break, btn2 place, btn3 cycle block, L1/R1 down/up,
-      Start saves; title shows PAD once input is seen) and a top-billing entry
-      in xp-launcher's games list.
+- [x] Stretch: gamepad support (now via the shared xp-pad mapping — real PS buttons)
+      and a top-billing entry in xp-launcher's games list.
+
+## The road to a full game
+
+Tick these off as they land. Ordered so the game is playable-feeling early and
+world-rich later; every step gets measured on the box before it counts.
+
+**Phase A — feels like a game**
+- [x] A1. Gravity, jumping, block collision (walk mode; F / double-tap CROSS toggles fly;
+      CROSS/SPACE jumps; axis-separated AABB vs blocks, 0.6x1.8 player box, no
+      measurable FPS cost)
+- [ ] A2. Hotbar UI with block icons + selection highlight (kill the title-bar readout)
+- [ ] A3. Day/night cycle (~10 min loop: sky + fog color + light-level shading)
+- [ ] A4. Sounds: dig/place/footsteps/jump (waveOut, tiny generated WAVs)
+
+**Phase B — a world worth exploring**
+- [ ] B1. Value-noise terrain with octaves (replace the layered sines)
+- [ ] B2. Taller world (raise WORLD_H past 16 — mesher masks are sized CHUNK*CHUNK,
+      must grow with it)
+- [ ] B3. Trees + wood/leaves/sand block types
+- [ ] B4. Water: translucent, non-solid, swimmable-ish (render pass after opaque)
+- [ ] B5. Caves (3D noise carve) + stone variety underground
+
+**Phase C — polish**
+- [ ] C1. Fullscreen at native 1366x768 + pause menu (CIRCLE/ESC: resume/save/quit)
+- [ ] C2. Async chunk remesh (edits already 4 ms; matters once the world grows)
+- [ ] C3. Bigger world / chunk streaming from disk
+- [ ] C4. Save versioning + player position saved with the world
+
+**Phase D — dreams**
+- [ ] D1. LAN multiplayer (the laptop joins the den as player 2)
+- [ ] D2. Simple mobs (wandering animals; the Atom sets the population cap)
 
 ## Style
 

@@ -80,10 +80,25 @@ static HWND g_hwnd;
 static float g_range = 64.0f;       /* view range in blocks */
 static const DWORD FOG_COLOR = D3DCOLOR_XRGB(0x87, 0xCE, 0xEB);
 
-/* fly camera (turntable until first movement key) */
+/* camera = the player's eye (turntable until first movement input) */
 static float g_cam_x, g_cam_y, g_cam_z;
 static float g_yaw, g_pitch;
 static int   g_manual;
+
+/* player physics: eye sits EYE_H above the feet of a 0.6 x 1.8 x 0.6 box */
+#define EYE_H     1.62f
+#define BOX_HALF  0.3f
+#define BOX_TOP   0.18f             /* head room above the eye */
+#define GRAVITY   28.0f
+#define JUMP_V    8.2f
+#define WALK_SPD  4.3f
+#define FLY_SPD   10.0f
+static int   g_walk = 1;            /* 0 = fly (noclip) */
+static float g_vel_y;
+static int   g_on_ground;
+/* per-frame movement intent, filled by keyboard + gamepad, applied once */
+static float g_move_s, g_move_f, g_move_u;
+static int   g_jump;
 
 /* block editing */
 static int   g_sel = B_PLANKS;      /* block type to place (keys 1-4) */
@@ -568,6 +583,80 @@ static void edit_place(void)
     set_block(prev[0], prev[1], prev[2], g_sel);
 }
 
+/* ------------------------------------------------------ player physics --- */
+
+/* does the player box (eye at ex,ey,ez) overlap any solid block? */
+static int box_hits(float ex, float ey, float ez)
+{
+    int x0 = (int)floorf(ex - BOX_HALF), x1 = (int)floorf(ex + BOX_HALF);
+    int y0 = (int)floorf(ey - EYE_H),    y1 = (int)floorf(ey + BOX_TOP);
+    int z0 = (int)floorf(ez - BOX_HALF), z1 = (int)floorf(ez + BOX_HALF);
+    for (int y = y0; y <= y1; y++)
+        for (int z = z0; z <= z1; z++)
+            for (int x = x0; x <= x1; x++)
+                if (block_at(x, y, z) != B_AIR)
+                    return 1;
+    return 0;
+}
+
+/* move the eye along one axis, clamping flush against the blocking face.
+ * axis: 0=x 1=y 2=z. Returns 1 if the move was blocked. */
+static int move_axis(float d, int axis)
+{
+    if (d == 0) return 0;
+    float *p = axis == 0 ? &g_cam_x : axis == 1 ? &g_cam_y : &g_cam_z;
+    *p += d;
+    if (!box_hits(g_cam_x, g_cam_y, g_cam_z)) return 0;
+
+    if (axis == 1) {
+        if (d < 0) {                /* feet hit the ground */
+            float feet = g_cam_y - EYE_H;
+            g_cam_y = (floorf(feet) + 1.0f) + EYE_H + 0.001f;
+        } else {                    /* head hit a ceiling */
+            float top = g_cam_y + BOX_TOP;
+            g_cam_y = floorf(top) - BOX_TOP - 0.001f;
+        }
+    } else {
+        float half = BOX_HALF;
+        if (d > 0) *p = floorf(*p + half) - half - 0.001f;
+        else       *p = (floorf(*p - half) + 1.0f) + half + 0.001f;
+    }
+    return 1;
+}
+
+static void step_player(float dt)
+{
+    float fx = sinf(g_yaw), fz = cosf(g_yaw);
+    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
+    float s = g_move_s, f = g_move_f;
+    float mag = sqrtf(s * s + f * f);
+    if (mag > 1) { s /= mag; f /= mag; }    /* no diagonal speed boost */
+
+    if (!g_walk) {                          /* fly: noclip, direct */
+        float sp = FLY_SPD * dt;
+        g_cam_x += (fx * f + rx * s) * sp;
+        g_cam_z += (fz * f + rz * s) * sp;
+        g_cam_y += g_move_u * sp;
+        g_vel_y = 0;
+        return;
+    }
+
+    move_axis((fx * f + rx * s) * WALK_SPD * dt, 0);
+    move_axis((fz * f + rz * s) * WALK_SPD * dt, 2);
+
+    g_vel_y -= GRAVITY * dt;
+    if (g_vel_y < -50) g_vel_y = -50;
+    g_on_ground = 0;
+    if (move_axis(g_vel_y * dt, 1)) {
+        if (g_vel_y < 0) g_on_ground = 1;
+        g_vel_y = 0;
+    }
+    if (g_jump && g_on_ground) {
+        g_vel_y = JUMP_V;
+        g_on_ground = 0;
+    }
+}
+
 /* --------------------------------------------------------- save / load --- */
 
 static void world_file_path(void)
@@ -691,17 +780,19 @@ static void update_camera(float dt, float t)
     }
 
     if (GetFocus() != g_hwnd) { g_mouse_reset = 1; return; }
+    (void)dt;
 
-    float speed = 10.0f * dt;
-    float fx = sinf(g_yaw), fz = cosf(g_yaw);
-    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
-
-    if (GetAsyncKeyState('W') & 0x8000) { g_manual = 1; g_cam_x += fx * speed; g_cam_z += fz * speed; }
-    if (GetAsyncKeyState('S') & 0x8000) { g_manual = 1; g_cam_x -= fx * speed; g_cam_z -= fz * speed; }
-    if (GetAsyncKeyState('D') & 0x8000) { g_manual = 1; g_cam_x += rx * speed; g_cam_z += rz * speed; }
-    if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_cam_x -= rx * speed; g_cam_z -= rz * speed; }
-    if (GetAsyncKeyState('E') & 0x8000) { g_manual = 1; g_cam_y += speed; }
-    if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_cam_y -= speed; }
+    if (GetAsyncKeyState('W') & 0x8000) { g_manual = 1; g_move_f += 1; }
+    if (GetAsyncKeyState('S') & 0x8000) { g_manual = 1; g_move_f -= 1; }
+    if (GetAsyncKeyState('D') & 0x8000) { g_manual = 1; g_move_s += 1; }
+    if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_move_s -= 1; }
+    if (GetAsyncKeyState('E') & 0x8000) { g_manual = 1; g_move_u += 1; }
+    if (GetAsyncKeyState('Q') & 0x8000) { g_manual = 1; g_move_u -= 1; }
+    if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
+        g_manual = 1;
+        g_jump = 1;                 /* walk: jump */
+        g_move_u += 1;              /* fly: rise */
+    }
 
     /* hold-repeat only; the initial click arrives via WM_L/RBUTTONDOWN */
     int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
@@ -759,13 +850,26 @@ static void update_gamepad_mapped(float dt)
         g_pad_seen = 1;
     }
 
-    float speed = 10.0f * dt;
-    float fx = sinf(g_yaw), fz = cosf(g_yaw);
-    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
-    g_cam_x += (fx * forward + rx * strafe) * speed;
-    g_cam_z += (fz * forward + rz * strafe) * speed;
-    if (p.cross)  g_cam_y += speed;
-    if (p.circle) g_cam_y -= speed;
+    g_move_s += strafe;
+    g_move_f += forward;
+    if (p.cross) {
+        g_jump = 1;                 /* walk: jump */
+        g_move_u += 1;              /* fly: rise */
+    }
+    if (p.circle) g_move_u -= 1;    /* fly: sink */
+
+    /* double-tap CROSS toggles walk/fly, Minecraft-creative style */
+    static unsigned prev_cross;
+    static DWORD last_tap;
+    if (p.cross && !prev_cross) {
+        DWORD now = GetTickCount();
+        if (now - last_tap < 300) {
+            g_walk = !g_walk;
+            g_vel_y = 0;
+        }
+        last_tap = now;
+    }
+    prev_cross = p.cross;
 
     g_yaw   += p.rx * 2.6f * dt;
     g_pitch -= p.ry * 2.6f * dt;    /* stick up = look up */
@@ -836,13 +940,10 @@ static void update_gamepad(float dt)
         g_pad_seen = 1;
     }
 
-    float speed = 10.0f * dt;
-    float fx = sinf(g_yaw), fz = cosf(g_yaw);
-    float rx = cosf(g_yaw), rz = -sinf(g_yaw);
-    g_cam_x += (fx * forward + rx * strafe) * speed;
-    g_cam_z += (fz * forward + rz * strafe) * speed;
-    if (b & 0x10) g_cam_y -= speed;             /* L1 down */
-    if (b & 0x20) g_cam_y += speed;             /* R1 up */
+    g_move_s += strafe;
+    g_move_f += forward;
+    if (b & 0x10) g_move_u -= 1;                /* L1 down */
+    if (b & 0x20) { g_move_u += 1; g_jump = 1; }/* R1 up / jump */
 
     g_yaw   += lx * 2.6f * dt;
     g_pitch += ly * 2.6f * dt;
@@ -874,6 +975,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) DestroyWindow(h);
         else if (w >= '1' && w <= '4') g_sel = (int)(w - '0');
+        else if (w == 'F') { g_walk = !g_walk; g_vel_y = 0; }
         else if (w == VK_F5) save_world();
         return 0;
     case WM_LBUTTONDOWN:            /* edge-triggered here so even sub-frame
@@ -1113,11 +1215,12 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         return 1;
     }
 
-    /* spawn standing at world center */
+    /* spawn standing at world center (walk mode; bench flies) */
     g_cam_x = WX / 2.0f;
     g_cam_z = WZ / 2.0f;
-    g_cam_y = terrain_h(WX / 2, WZ / 2) + 1.7f;
+    g_cam_y = terrain_h(WX / 2, WZ / 2) + EYE_H + 0.01f;
     g_pitch = 0.15f;
+    if (g_bench) g_walk = 0;
 
     ShowWindow(g_hwnd, show);
 
@@ -1146,8 +1249,12 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_pitch = 0.15f;
         } else {
             g_click_cd -= dt;       /* shared break/place cooldown */
+            g_move_s = g_move_f = g_move_u = 0;
+            g_jump = 0;
             update_camera(dt, (float)td);
             update_gamepad(dt);
+            if (dt > 0.1f) dt = 0.1f;   /* no physics warp after hitches */
+            step_player(dt);
         }
 
         tris = render_frame(&nchunks);
@@ -1159,9 +1266,10 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         if (sec >= 1.0) {
             char title[160];
             sprintf(title, "xp-craft - %.0f FPS - r=%.0f - %d tris, %d chunks"
-                           " - %s VP - place: %s - remesh %d ms%s",
+                           " - %s VP - %s - place: %s - remesh %d ms%s",
                     frames / sec, g_range, tris, nchunks,
-                    g_hwvp ? "HW" : "SW", BLOCK_NAME[g_sel], g_remesh_ms,
+                    g_hwvp ? "HW" : "SW", g_walk ? "walk" : "fly",
+                    BLOCK_NAME[g_sel], g_remesh_ms,
                     g_pad_seen ? " - PAD" : "");
             SetWindowTextA(g_hwnd, title);
             frames = 0;
