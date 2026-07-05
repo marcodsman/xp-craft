@@ -1331,7 +1331,7 @@ static void update_mobs(float dt)
         }
         int day = g_daylight > 0.6f;
         int want = day ? M_PIG : M_ZOMBIE;
-        if ((want == M_PIG && pigs < 4) || (want == M_ZOMBIE && zombies < 6)) {
+        if ((want == M_PIG && pigs < 4) || (want == M_ZOMBIE && zombies < 4)) {
             float ang = (mrng() % 628) / 100.0f;
             float d = 22 + mrng() % 18;
             int sx = (int)(g_cam_x + sinf(ang) * d);
@@ -1370,11 +1370,11 @@ static void update_mobs(float dt)
                 g_mob[i].type = M_NONE;
                 continue;
             }
-            if (pdist < 20 && g_walk && !g_dead) {
+            if (pdist < 14 && g_walk && !g_dead) {
                 g_mob[i].yaw = atan2f(pdx, pdz);
                 speed = 2.3f;
                 if (pdist < 1.5f && g_mob[i].atk_cd <= 0) {
-                    g_mob[i].atk_cd = 1.0f;
+                    g_mob[i].atk_cd = 1.3f;
                     damage(2);
                 }
             }
@@ -2415,12 +2415,12 @@ static void update_daylight(float dt)
     /* 0.0-0.45 day, 0.45-0.55 dusk, 0.55-0.95 night, 0.95-1.0 dawn */
     float L;
     if (g_tod < 0.45f)      L = 1.0f;
-    else if (g_tod < 0.55f) L = 1.0f - (g_tod - 0.45f) * 10.0f * 0.78f;
-    else if (g_tod < 0.95f) L = 0.22f;
-    else                    L = 0.22f + (g_tod - 0.95f) * 20.0f * 0.78f;
+    else if (g_tod < 0.55f) L = 1.0f - (g_tod - 0.45f) * 10.0f * 0.70f;
+    else if (g_tod < 0.95f) L = 0.30f;
+    else                    L = 0.30f + (g_tod - 0.95f) * 20.0f * 0.70f;
     g_daylight = L;
 
-    float k = (L - 0.22f) / 0.78f;
+    float k = (L - 0.30f) / 0.70f;
     int r = (int)(8 + (135 - 8) * k);
     int g = (int)(10 + (206 - 10) * k);
     int b = (int)(28 + (235 - 28) * k);
