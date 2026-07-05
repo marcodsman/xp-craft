@@ -156,7 +156,7 @@ static int   g_walk = 1;
 static float g_vel_y;
 static int   g_on_ground, g_in_water;
 static float g_move_s, g_move_f, g_move_u;
-static int   g_jump;
+static int   g_jump, g_sprint, g_sneak;
 static float g_step_dist;
 
 static int   g_hotbar_idx = 3;      /* start on planks */
@@ -1102,6 +1102,7 @@ static void mark_dirty(int cx, int cz)
 }
 
 static void play_sound(int which);     /* fwd */
+static void play_sound_at(int which, float x, float y, float z);
 
 static void set_block(int x, int y, int z, int b)
 {
@@ -1314,13 +1315,32 @@ static void respawn(void)
     g_cam_z = g_spawn_z;
 }
 
+/* sand falls straight down until it rests on something solid; each fall
+ * pulls the next sand block in the column after it */
+static void settle_sand_column(int x, int y, int z)
+{
+    while (y < WORLD_H && g_world[y][z][x] == B_SAND) {
+        int ny = y;
+        while (ny > 1 && !solid_block(block_at(x, ny - 1, z)))
+            ny--;
+        if (ny == y) break;
+        set_block(x, y, z, B_AIR);
+        set_block(x, ny, z, B_SAND);
+        y++;
+    }
+}
+
 static void break_complete(int x, int y, int z)
 {
     int blk = block_at(x, y, z);
     if (blk == B_AIR || blk == B_WATER) return;
     set_block(x, y, z, B_AIR);
+    settle_sand_column(x, y + 1, z);    /* sand above comes down */
     if (g_walk) {                       /* survival: the block drops */
-        spawn_drop(x + 0.5f, y + 0.4f, z + 0.5f, DROPS[blk], 1);
+        g_food -= 0.03f;                /* hunger: digging */
+        if (g_food < 0) g_food = 0;
+        if (DROPS[blk])
+            spawn_drop(x + 0.5f, y + 0.4f, z + 0.5f, DROPS[blk], 1);
         spawn_particles(x, y, z, blk, 10);
     } else
         spawn_particles(x, y, z, blk, 6);
@@ -1384,11 +1404,15 @@ static void update_breaking(float dt, int held)
         float H = HARD_BASE[blk];
         if (H <= 0) H = 0.2f;
         int cls = BLOCK_CLASS[blk];
-        int wood = 0, stone = 0;
-        if (cls == CL_PICK)   { wood = g_inv[I_WPICK];   stone = g_inv[I_SPICK]; }
-        if (cls == CL_AXE)    { wood = g_inv[I_WAXE];    stone = g_inv[I_SAXE]; }
-        if (cls == CL_SHOVEL) { wood = g_inv[I_WSHOVEL]; stone = g_inv[I_SSHOVEL]; }
-        if (stone > 0)      hard = 1.5f * H / 4.0f;
+        int wood = 0, stone = 0, iron = 0;
+        if (cls == CL_PICK)   { wood = g_inv[I_WPICK];   stone = g_inv[I_SPICK];
+                                iron = g_inv[I_IPICK]; }
+        if (cls == CL_AXE)    { wood = g_inv[I_WAXE];    stone = g_inv[I_SAXE];
+                                iron = g_inv[I_IAXE]; }
+        if (cls == CL_SHOVEL) { wood = g_inv[I_WSHOVEL]; stone = g_inv[I_SSHOVEL];
+                                iron = g_inv[I_ISHOVEL]; }
+        if (iron > 0)       hard = 1.5f * H / 6.0f;
+        else if (stone > 0) hard = 1.5f * H / 4.0f;
         else if (wood > 0)  hard = 1.5f * H / 2.0f;
         else                hard = (cls == CL_PICK ? 5.0f : 1.5f) * H;
     }
@@ -1417,6 +1441,8 @@ static void edit_place(void)
         g_inv[g_sel]--;
     }
     set_block(prev[0], prev[1], prev[2], g_sel);
+    if (g_sel == B_SAND)
+        settle_sand_column(prev[0], prev[1], prev[2]);
     play_sound(1);
     swing_kick();
 }
@@ -1531,6 +1557,22 @@ static int move_axis(float d, int axis)
     return 1;
 }
 
+/* is there anything solid under any part of the player box? */
+static int has_support(void)
+{
+    float feet = g_cam_y - EYE_H - 0.06f;
+    int y = (int)floorf(feet);
+    int x0 = (int)floorf(g_cam_x - BOX_HALF),
+        x1 = (int)floorf(g_cam_x + BOX_HALF);
+    int z0 = (int)floorf(g_cam_z - BOX_HALF),
+        z1 = (int)floorf(g_cam_z + BOX_HALF);
+    for (int z = z0; z <= z1; z++)
+        for (int x = x0; x <= x1; x++)
+            if (solid_block(block_at(x, y, z)))
+                return 1;
+    return 0;
+}
+
 static void step_player(float dt)
 {
     float fx = sinf(g_yaw), fz = cosf(g_yaw);
@@ -1554,10 +1596,16 @@ static void step_player(float dt)
                           (int)floorf(g_cam_z)) == B_WATER;
 
     float spd = WALK_SPD * (g_in_water ? 0.6f : 1.0f);
+    if (g_sneak)                       spd *= 0.35f;
+    else if (g_sprint && g_move_f > 0) spd *= 1.6f;
+    int guard = g_sneak && g_on_ground && !g_in_water;
+    float keep_x = g_cam_x, keep_z = g_cam_z;
     float mdx = (fx * f + rx * s) * spd * dt;
     float mdz = (fz * f + rz * s) * spd * dt;
     move_axis(mdx, 0);
+    if (guard && !has_support()) g_cam_x = keep_x;  /* sneak edge guard */
     move_axis(mdz, 2);
+    if (guard && !has_support()) g_cam_z = keep_z;
 
     if (g_in_water) {
         g_vel_y -= 7.0f * dt;
@@ -1603,6 +1651,8 @@ static void step_player(float dt)
         float moved = sqrtf(mdx * mdx + mdz * mdz);
         g_step_dist += moved;
         g_bob += moved * 3.2f;
+        g_food -= moved * (g_sprint ? 0.014f : 0.004f);
+        if (g_food < 0) g_food = 0;
         if (g_step_dist > 2.1f) {
             g_step_dist = 0;
             play_sound(2);
@@ -1667,6 +1717,7 @@ static struct {
     int   type, hp, on_ground;
     float x, y, z, yaw, vy;
     float dir_t, atk_cd, hurt_t, flee_t;
+    float walk_ph, snd_t;           /* leg animation, next grunt */
 } g_mob[NMOBS];
 static float g_spawn_tick;
 static int   g_mob_freeze;          /* mobtest: statues for screenshots */
@@ -1783,6 +1834,12 @@ static void update_mobs(float dt)
             g_mob[i].yaw = (mrng() % 628) / 100.0f;
         }
         if (g_mob[i].dir_t > 0) speed = 1.2f;
+        if ((g_mob[i].snd_t -= dt) <= 0) {  /* idle grunts, distance-faded */
+            g_mob[i].snd_t = 5 + mrng() % 8;
+            if (pdist < 20)
+                play_sound_at(g_mob[i].type == M_ZOMBIE ? 5 : 6,
+                              g_mob[i].x, g_mob[i].y, g_mob[i].z);
+        }
 
         if (g_mob[i].type == M_ZOMBIE) {
             if (g_daylight > 0.7f) {    /* burns off in daylight */
@@ -1792,6 +1849,7 @@ static void update_mobs(float dt)
             if (pdist < 14 && g_walk && !g_dead) {
                 g_mob[i].yaw = atan2f(pdx, pdz);
                 speed = 2.3f;
+                if (g_mob[i].snd_t > 2.5f) g_mob[i].snd_t = 2.5f;
                 if (pdist < 1.5f && g_mob[i].atk_cd <= 0) {
                     g_mob[i].atk_cd = 1.3f;
                     damage(2);
@@ -1802,6 +1860,7 @@ static void update_mobs(float dt)
             speed = 2.6f;
         }
 
+        if (speed > 0) g_mob[i].walk_ph += speed * dt * 2.8f;
         g_mob[i].vy -= GRAVITY * dt;
         if (g_mob[i].vy < -30) g_mob[i].vy = -30;
         int blocked = mob_move(i, sinf(g_mob[i].yaw) * speed * dt,
@@ -1852,7 +1911,8 @@ static int ray_mob(void)
 static void attack_mob(int i)
 {
     int dmg = 1;                        /* bare hand */
-    if (g_inv[I_SSWORD]) dmg = 5;
+    if (g_inv[I_ISWORD]) dmg = 6;
+    else if (g_inv[I_SSWORD]) dmg = 5;
     else if (g_inv[I_WSWORD]) dmg = 4;
     if (!g_walk) dmg = 20;              /* creative one-shots */
     g_mob[i].hp -= dmg;
@@ -1890,7 +1950,7 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x38435058 /* "XPC8" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x39435058 /* "XPC9" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
     float ext[6] = { g_spawn_x, g_spawn_y, g_spawn_z,
@@ -1900,6 +1960,11 @@ static void save_world(void)
     fwrite(ext, sizeof ext, 1, fp);
     fwrite(g_inv, sizeof g_inv, 1, fp);
     fwrite(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
+    for (int i = 0; i < NMOBS; i++) {   /* v9: the critters survive saves */
+        float m[6] = { (float)g_mob[i].type, g_mob[i].x, g_mob[i].y,
+                       g_mob[i].z, (float)g_mob[i].hp, g_mob[i].yaw };
+        fwrite(m, sizeof m, 1, fp);
+    }
     fclose(fp);
     strcpy(g_toast, "WORLD SAVED");
     g_toast_t = 2.0f;
@@ -1912,7 +1977,7 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        hdr[0] < 0x32435058 || hdr[0] > 0x38435058 ||
+        hdr[0] < 0x32435058 || hdr[0] > 0x39435058 ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1952,6 +2017,16 @@ static int load_world(void)
         }
     }
     size_t ok = fread(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
+    if (ok == 1 && hdr[0] >= 0x39435058) {
+        for (int i = 0; i < NMOBS; i++) {
+            float m[6];
+            if (fread(m, sizeof m, 1, fp) != 1) break;
+            g_mob[i].type = (int)m[0];
+            g_mob[i].x = m[1]; g_mob[i].y = m[2]; g_mob[i].z = m[3];
+            g_mob[i].hp = (int)m[4];
+            g_mob[i].yaw = m[5];
+        }
+    }
     fclose(fp);
     if (ok != 1) return 0;
     g_cam_x = st[0]; g_cam_y = st[1]; g_cam_z = st[2];
@@ -1970,7 +2045,7 @@ static int load_world(void)
  * 22 kHz effects: 0=dig 1=place 2=step 3=jump. volume=0 disables. */
 
 #define SND_HZ 22050
-#define NSOUNDS 5                   /* dig place step jump hurt */
+#define NSOUNDS 7               /* dig place step jump hurt groan oink */
 static struct { short *pcm; int len; } g_snd[NSOUNDS];
 static struct { HWAVEOUT h; WAVEHDR hdr; int busy; } g_voice[4];
 static int g_volume = 35;
@@ -1981,6 +2056,7 @@ static void gen_sounds(void)
     for (int s = 0; s < NSOUNDS; s++) {
         int len = s == 0 ? SND_HZ / 11 : s == 1 ? SND_HZ / 28
                 : s == 2 ? SND_HZ / 18 : s == 3 ? SND_HZ / 9
+                : s == 5 ? SND_HZ * 3 / 5 : s == 6 ? SND_HZ / 5
                 : SND_HZ / 6;
         short *p = malloc(sizeof(short) * len);
         float lp = 0;
@@ -2005,6 +2081,19 @@ static void gen_sounds(void)
                 break;
             case 3:                     /* jump: rising chirp */
                 v = sinf(i * 2 * 3.14159f * (300 + 400 * t) / SND_HZ) * 0.4f;
+                break;
+            case 5:                     /* zombie groan: slow low moan */
+                v = sinf(i * 2 * 3.14159f * (72 - 18 * t) / SND_HZ) * 0.5f
+                  + sinf(i * 2 * 3.14159f * (145 - 30 * t) / SND_HZ) * 0.2f
+                  + n * 0.12f;
+                env = sinf(3.14159f * t);   /* swell in and out */
+                break;
+            case 6:                     /* pig oink: two nasal pulses */
+                v = sinf(i * 2 * 3.14159f * (260 - 90 * t) / SND_HZ) * 0.5f
+                  + n * 0.3f;
+                env = (t < 0.45f ? sinf(3.14159f * t / 0.45f)
+                                 : sinf(3.14159f * (t - 0.5f) / 0.5f)) * 0.9f;
+                if (env < 0) env = 0;
                 break;
             default:                    /* hurt: falling groan + thump */
                 v = sinf(i * 2 * 3.14159f * (200 - 110 * t) / SND_HZ) * 0.55f
@@ -2033,9 +2122,9 @@ static void gen_sounds(void)
     }
 }
 
-static void play_sound(int which)
+static void play_sound_vol(int which, float frac)
 {
-    if (g_volume <= 0 || g_bench) return;
+    if (g_volume <= 0 || g_bench || frac <= 0.02f) return;
     for (int i = 0; i < 4; i++) {
         if (!g_voice[i].h) continue;
         if (g_voice[i].busy) {
@@ -2046,6 +2135,8 @@ static void play_sound(int which)
             } else
                 continue;
         }
+        DWORD vol = (DWORD)(g_volume * 65535 / 100 * frac);
+        waveOutSetVolume(g_voice[i].h, (vol << 16) | vol);
         memset(&g_voice[i].hdr, 0, sizeof(WAVEHDR));
         g_voice[i].hdr.lpData = (LPSTR)g_snd[which].pcm;
         g_voice[i].hdr.dwBufferLength = g_snd[which].len * 2;
@@ -2056,6 +2147,16 @@ static void play_sound(int which)
             g_voice[i].busy = 1;
         return;
     }
+}
+
+static void play_sound(int which) { play_sound_vol(which, 1.0f); }
+
+/* world-positioned sound: linear falloff to silence at 24 blocks */
+static void play_sound_at(int which, float x, float y, float z)
+{
+    float dx = x - g_cam_x, dy = y - g_cam_y, dz = z - g_cam_z;
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    play_sound_vol(which, 1.0f - d / 24.0f);
 }
 
 /* ------------------------------------------------------------- textures -- */
@@ -2613,6 +2714,8 @@ static void update_camera(float dt, float t)
         g_jump = 1;
         g_move_u += 1;
     }
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   g_sprint = 1;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) g_sneak = 1;
     if (GetAsyncKeyState(VK_OEM_4) & 0x8000) {
         if (g_range > 32) { g_range -= 1; apply_range(); }
     }
@@ -2698,6 +2801,8 @@ static void update_gamepad_mapped(float dt)
         g_move_u += 1;
     }
     if (p.circle) g_move_u -= 1;
+    if (p.circle && g_walk) g_sneak = 1;    /* walk: sneak */
+    if (p.l1) g_sprint = 1;
 
     if (p.cross && !prev_cross) {
         DWORD now = GetTickCount();
@@ -2962,19 +3067,38 @@ static void draw_mobs(void)
         D3DMATRIX m = mat_mul(&r, &t);
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &m);
 
-        VTX mv[72];
+        VTX mv[240];    /* up to 6 boxes */
         int n, hurt = g_mob[i].hurt_t > 0;
         int lit = g_bright[light_level((int)floorf(g_mob[i].x),
                                        (int)floorf(g_mob[i].y + 0.5f),
                                        (int)floorf(g_mob[i].z))];
+        float sw = sinf(g_mob[i].walk_ph) * 0.14f;
         if (g_mob[i].type == M_PIG) {
             n  = emit_box(mv, 0, 0.50f, 0, 0.30f, 0.25f, 0.45f, hurt, lit);
             n += emit_box(mv + n, 0, 0.62f, 0.55f, 0.22f, 0.22f, 0.20f,
                           hurt, lit);
+            /* four stumpy legs, diagonal pairs swinging */
+            n += emit_box(mv + n, -0.17f, 0.13f,  0.30f + sw, 0.09f, 0.13f,
+                          0.09f, hurt, lit);
+            n += emit_box(mv + n,  0.17f, 0.13f,  0.30f - sw, 0.09f, 0.13f,
+                          0.09f, hurt, lit);
+            n += emit_box(mv + n, -0.17f, 0.13f, -0.30f - sw, 0.09f, 0.13f,
+                          0.09f, hurt, lit);
+            n += emit_box(mv + n,  0.17f, 0.13f, -0.30f + sw, 0.09f, 0.13f,
+                          0.09f, hurt, lit);
         } else {
-            n  = emit_box(mv, 0, 0.55f, 0, 0.25f, 0.55f, 0.15f, hurt, lit);
-            n += emit_box(mv + n, 0, 1.34f, 0, 0.24f, 0.24f, 0.24f,
+            n  = emit_box(mv, 0, 0.85f, 0, 0.25f, 0.35f, 0.15f, hurt, lit);
+            n += emit_box(mv + n, 0, 1.44f, 0, 0.24f, 0.24f, 0.24f,
                           hurt, lit);
+            /* legs stride, arms reach forward and bob */
+            n += emit_box(mv + n, -0.12f, 0.25f, sw, 0.10f, 0.25f, 0.10f,
+                          hurt, lit);
+            n += emit_box(mv + n,  0.12f, 0.25f, -sw, 0.10f, 0.25f, 0.10f,
+                          hurt, lit);
+            n += emit_box(mv + n, -0.20f, 1.05f, 0.38f + sw * 0.3f, 0.07f,
+                          0.07f, 0.26f, hurt, lit);
+            n += emit_box(mv + n,  0.20f, 1.05f, 0.38f - sw * 0.3f, 0.07f,
+                          0.07f, 0.26f, hurt, lit);
         }
         IDirect3DDevice9_SetTexture(g_dev, 0,
             (IDirect3DBaseTexture9 *)g_mobtex[g_mob[i].type == M_PIG ? 0 : 1]);
@@ -3584,7 +3708,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_click_cd -= dt;
             g_atk_cd -= dt;
             g_move_s = g_move_f = g_move_u = 0;
-            g_jump = 0;
+            g_jump = g_sprint = g_sneak = 0;
             g_break_held = 0;
             if (!g_paused) update_camera(dt, (float)td);
             update_gamepad(dt);
