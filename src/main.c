@@ -179,6 +179,13 @@ static float g_regen_t, g_drown_t;
 static float g_spawn_x, g_spawn_y, g_spawn_z;
 static int   g_head_in_water;       /* eye truly submerged (HUD tint) */
 
+/* item drop entities: spinning mini-cubes, magnet to the player */
+#define NDROPS 64
+static struct {
+    float x, y, z, vx, vy, vz, age;
+    int item, count;                /* item 0 = free slot */
+} g_drop[NDROPS];
+
 /* particles */
 #define NPART 96
 static struct {
@@ -1136,6 +1143,75 @@ static int raycast(int hit[3], int prev[3])
     return 0;
 }
 
+static unsigned g_drng = 424242;
+static unsigned drng(void) { g_drng = g_drng * 1664525u + 1013904223u;
+                             return g_drng >> 16; }
+
+static void spawn_drop(float x, float y, float z, int item, int count)
+{
+    for (int i = 0; i < NDROPS; i++) {
+        if (g_drop[i].item) continue;
+        g_drop[i].x = x; g_drop[i].y = y; g_drop[i].z = z;
+        g_drop[i].vx = ((int)(drng() % 100) - 50) * 0.02f;
+        g_drop[i].vz = ((int)(drng() % 100) - 50) * 0.02f;
+        g_drop[i].vy = 2.5f;
+        g_drop[i].age = 0;
+        g_drop[i].item = item;
+        g_drop[i].count = count;
+        return;
+    }
+}
+
+static void update_drops(float dt)
+{
+    for (int i = 0; i < NDROPS; i++) {
+        if (!g_drop[i].item) continue;
+        g_drop[i].age += dt;
+        if (g_drop[i].age > 300) { g_drop[i].item = 0; continue; }
+
+        /* magnet + pickup (survival only) */
+        float dx = g_cam_x - g_drop[i].x;
+        float dy = (g_cam_y - EYE_H + 0.6f) - g_drop[i].y;
+        float dz = g_cam_z - g_drop[i].z;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        if (g_walk && !g_dead && g_drop[i].age > 0.6f) {
+            if (d2 < 0.8f * 0.8f) {
+                g_inv[g_drop[i].item] += g_drop[i].count;
+                g_drop[i].item = 0;
+                play_sound(1);
+                continue;
+            }
+            if (d2 < 2.6f * 2.6f) {     /* pull in */
+                float d = sqrtf(d2) + 0.001f;
+                g_drop[i].vx += dx / d * 18.0f * dt;
+                g_drop[i].vy += dy / d * 18.0f * dt;
+                g_drop[i].vz += dz / d * 18.0f * dt;
+            }
+        }
+
+        g_drop[i].vy -= 16.0f * dt;
+        if (g_drop[i].vy < -20) g_drop[i].vy = -20;
+        float nx = g_drop[i].x + g_drop[i].vx * dt;
+        float ny = g_drop[i].y + g_drop[i].vy * dt;
+        float nz = g_drop[i].z + g_drop[i].vz * dt;
+        /* point-vs-block: settle on solid ground, slide off walls */
+        if (solid_block(block_at((int)floorf(nx), (int)floorf(g_drop[i].y),
+                                 (int)floorf(g_drop[i].z))))
+            { g_drop[i].vx = 0; nx = g_drop[i].x; }
+        if (solid_block(block_at((int)floorf(nx), (int)floorf(g_drop[i].y),
+                                 (int)floorf(nz))))
+            { g_drop[i].vz = 0; nz = g_drop[i].z; }
+        if (solid_block(block_at((int)floorf(nx), (int)floorf(ny - 0.12f),
+                                 (int)floorf(nz)))) {
+            ny = floorf(ny - 0.12f) + 1.13f;
+            g_drop[i].vy = 0;
+            g_drop[i].vx *= 0.8f;       /* ground friction */
+            g_drop[i].vz *= 0.8f;
+        }
+        g_drop[i].x = nx; g_drop[i].y = ny; g_drop[i].z = nz;
+    }
+}
+
 static void spawn_particles(int x, int y, int z, int blk, int n)
 {
     int tile = TILE_FOR[blk][F_NORTH];
@@ -1185,6 +1261,19 @@ static void damage(int hp)
         g_health = 0;
         g_dead = 1;
         g_break_on = 0;
+        /* MC-style death drop, softened: materials scatter at the death
+         * spot (come back for them!), tools stay with you */
+        for (int it = 1; it < NITEMS; it++) {
+            if (it == B_WATER || it == I_WPICK || it == I_WAXE ||
+                it == I_WSHOVEL || it == I_SPICK || it == I_SAXE ||
+                it == I_SSHOVEL || it == I_WSWORD || it == I_SSWORD)
+                continue;
+            while (g_inv[it] > 0) {
+                int n = g_inv[it] > 16 ? 16 : g_inv[it];
+                g_inv[it] -= n;
+                spawn_drop(g_cam_x, g_cam_y - 0.8f, g_cam_z, it, n);
+            }
+        }
     }
 }
 
@@ -1206,7 +1295,7 @@ static void break_complete(int x, int y, int z)
     if (blk == B_AIR || blk == B_WATER) return;
     set_block(x, y, z, B_AIR);
     if (g_walk) {                       /* survival: the block drops */
-        g_inv[DROPS[blk]]++;
+        spawn_drop(x + 0.5f, y + 0.4f, z + 0.5f, DROPS[blk], 1);
         spawn_particles(x, y, z, blk, 10);
     } else
         spawn_particles(x, y, z, blk, 6);
@@ -1717,8 +1806,9 @@ static void attack_mob(int i)
         g_mob[i].vy = 4.0f;
     }
     if (g_mob[i].hp <= 0) {
-        if (g_mob[i].type == M_PIG && g_walk)
-            g_inv[I_PORK] += 1 + (mrng() & 1);
+        if (g_mob[i].type == M_PIG)
+            spawn_drop(g_mob[i].x, g_mob[i].y + 0.5f, g_mob[i].z,
+                       I_PORK, 1 + (int)(mrng() & 1));
         g_mob[i].type = M_NONE;
         play_sound(0);
     }
@@ -2781,6 +2871,45 @@ static void draw_mobs(void)
     IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &ident);
 }
 
+static IDirect3DTexture9 *item_tex(int item)
+{
+    if (item < NBLOCKS) return g_tex[TILE_FOR[item][F_NORTH]];
+    if (item == I_PORK) return g_mobtex[0];
+    if (item == I_STICK) return g_tex[T_LOG_SIDE];
+    return g_tex[T_PLANKS];
+}
+
+/* spinning bobbing mini-cubes for dropped items */
+static void draw_drops(void)
+{
+    IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+    for (int i = 0; i < NDROPS; i++) {
+        if (!g_drop[i].item) continue;
+        float dx = g_drop[i].x - g_cam_x, dz = g_drop[i].z - g_cam_z;
+        if (dx * dx + dz * dz > g_range * g_range) continue;
+
+        int lit = g_bright[light_level((int)floorf(g_drop[i].x),
+                                       (int)floorf(g_drop[i].y),
+                                       (int)floorf(g_drop[i].z))];
+        D3DMATRIX r = mat_rot_y(g_drop[i].age * 1.8f);
+        D3DMATRIX t = mat_translate(g_drop[i].x,
+                                    g_drop[i].y +
+                                        sinf(g_drop[i].age * 2.6f) * 0.04f,
+                                    g_drop[i].z);
+        D3DMATRIX m = mat_mul(&r, &t);
+        IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &m);
+
+        VTX dv[36];
+        int n = emit_box(dv, 0, 0, 0, 0.09f, 0.09f, 0.09f, 0, lit);
+        IDirect3DDevice9_SetTexture(g_dev, 0,
+                (IDirect3DBaseTexture9 *)item_tex(g_drop[i].item));
+        IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, n / 3,
+                                         dv, sizeof(VTX));
+    }
+    D3DMATRIX ident = mat_identity();
+    IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &ident);
+}
+
 /* -------------------------------------------------------------- render --- */
 
 static int g_drawn_tris, g_drawn_chunks;
@@ -2861,7 +2990,7 @@ static void render_frame(void)
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, TRUE);
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE, FALSE);
 
-        if (!g_bench) draw_mobs();
+        if (!g_bench) { draw_mobs(); draw_drops(); }
 
         /* particles: camera-facing quads, grouped per tile texture */
         {
@@ -3228,6 +3357,16 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         }
     }
 
+    if (cmdline && strstr(cmdline, "survtest")) { /* dev: stand in survival */
+        int tx = (int)g_cam_x, tz = (int)g_cam_z;
+        int ty = WORLD_H - 1;
+        while (ty > 1 && !solid_block(g_world[ty - 1][tz][tx])) ty--;
+        g_cam_y = ty + EYE_H + 0.01f;
+        g_walk = 1; g_manual = 1;
+        g_yaw = 1.5708f; g_pitch = 0.30f;
+        g_health = 20;
+    }
+
     if (cmdline && strstr(cmdline, "torchtest")) { /* dev: torch + camera */
         int tx = (int)g_cam_x + 3, tz = (int)g_cam_z;
         int ty = WORLD_H - 1;
@@ -3358,6 +3497,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
                 step_player(dt);
                 update_survival(dt);
                 update_mobs(dt);
+                update_drops(dt);
                 g_autosave_t += dt;
                 if (g_autosave_t > AUTOSAVE_S) {
                     g_autosave_t = 0;
