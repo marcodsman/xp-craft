@@ -141,6 +141,11 @@ static int   g_break_cell[3];
 static float g_break_prog;          /* 0..1 */
 static IDirect3DTexture9 *g_crack;
 
+/* first-person hand: the held block swings while digging/placing */
+static float g_swing;               /* 0..1 animation phase */
+static int   g_swing_on;
+static float g_bob;                 /* walk-bob phase */
+
 /* particles */
 #define NPART 96
 static struct {
@@ -870,6 +875,14 @@ static void update_particles(float dt)
     }
 }
 
+static void swing_kick(void)
+{
+    if (!g_swing_on) {
+        g_swing_on = 1;
+        g_swing = 0;
+    }
+}
+
 static void break_complete(int x, int y, int z)
 {
     int blk = block_at(x, y, z);
@@ -888,8 +901,10 @@ static void edit_break(void)
 {
     int hit[3], prev[3];
     if (g_walk) return;                 /* survival digs via update_breaking */
-    if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H)
+    if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H) {
         break_complete(hit[0], hit[1], hit[2]);
+        swing_kick();
+    }
 }
 
 /* survival: hold-to-dig with per-block hardness */
@@ -937,6 +952,7 @@ static void edit_place(void)
     }
     set_block(prev[0], prev[1], prev[2], g_sel);
     play_sound(1);
+    swing_kick();
 }
 
 /* the one recipe so far (MineClone2 data: 1 log -> 4 planks) */
@@ -1040,9 +1056,11 @@ static void step_player(float dt)
         play_sound(3);
     }
 
-    /* footsteps */
+    /* footsteps + walk bob */
     if (g_on_ground && !g_in_water) {
-        g_step_dist += sqrtf(mdx * mdx + mdz * mdz);
+        float moved = sqrtf(mdx * mdx + mdz * mdz);
+        g_step_dist += moved;
+        g_bob += moved * 3.2f;
         if (g_step_dist > 2.1f) {
             g_step_dist = 0;
             play_sound(2);
@@ -2040,6 +2058,54 @@ static void render_frame(void)
                                              sizeof(LVTX));
         }
 
+        /* first-person hand: held block, swings on dig/place, bobs on walk */
+        if (!g_bench && !g_paused) {
+            float sw = sinf(g_swing * 3.14159f);      /* 0..1..0 */
+            D3DMATRIX sc = mat_identity();
+            sc.m[0][0] = sc.m[1][1] = sc.m[2][2] = 0.34f;
+            D3DMATRIX rx = mat_rot_x(-0.30f - sw * 0.85f);
+            D3DMATRIX ry = mat_rot_y(0.5f + sw * 0.3f);
+            D3DMATRIX tr = mat_translate(
+                0.55f - sw * 0.15f,
+                -0.52f - sw * 0.12f + sinf(g_bob) * 0.02f,
+                1.05f - sw * 0.08f);
+            D3DMATRIX m = mat_mul(&sc, &rx);
+            m = mat_mul(&m, &ry);
+            m = mat_mul(&m, &tr);
+            D3DMATRIX ident = mat_identity();
+            IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &m);
+            IDirect3DDevice9_SetTransform(g_dev, D3DTS_VIEW, &ident);
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE,
+                                            D3DZB_FALSE);
+
+            VTX hv[36];
+            int vi = 0;
+            for (int f = 0; f < 6; f++) {
+                int s = 255 * FACES[f].shade / 100;
+                DWORD col = D3DCOLOR_ARGB(255, s, s, s);
+                float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+                VTX c4[4];
+                for (int k = 0; k < 4; k++) {
+                    const BYTE *o = FACES[f].c[k];
+                    c4[k].x = o[0] - 0.5f;
+                    c4[k].y = o[1] - 0.5f;
+                    c4[k].z = o[2] - 0.5f;
+                    c4[k].color = col;
+                    c4[k].u = uv[k][0];
+                    c4[k].v = uv[k][1];
+                }
+                hv[vi++] = c4[0]; hv[vi++] = c4[1]; hv[vi++] = c4[2];
+                hv[vi++] = c4[0]; hv[vi++] = c4[2]; hv[vi++] = c4[3];
+            }
+            IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+            IDirect3DDevice9_SetTexture(g_dev, 0,
+                    (IDirect3DBaseTexture9 *)g_tex[TILE_FOR[g_sel][F_NORTH]]);
+            IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, 12,
+                                             hv, sizeof(VTX));
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE,
+                                            D3DZB_TRUE);
+        }
+
         /* ------------------------------------------------------- HUD ----- */
         if (!g_bench) {
             hud_begin();
@@ -2282,6 +2348,14 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
                     g_click_cd <= 0) {
                     edit_place();
                     g_click_cd = 0.22f;
+                }
+                if (g_break_held) swing_kick();
+                if (g_swing_on) {       /* hand swing animation */
+                    g_swing += dt / 0.3f;
+                    if (g_swing >= 1) {
+                        if (g_break_held) g_swing = 0;   /* keep chopping */
+                        else { g_swing_on = 0; g_swing = 0; }
+                    }
                 }
                 update_breaking(dt, g_break_held);
                 update_particles(dt);
