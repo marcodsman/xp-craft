@@ -110,6 +110,21 @@ running on our engine)
       night (chase, melee, burn at dawn), swords (wood 4 / stone 5 dmg, auto-apply),
       knockback, population caps sized for the Atom. Nothing survives the save file.
 
+**Phase F — the overnight sprint (2026-07-06): closing the gap list**
+- [x] F1. Per-block lighting: sky + block channels, BFS propagation, incremental
+      relight on edits, warm-tinted torch pools, dark caves. Torches craftable
+      (stick + coal). Cost: light-keyed greedy meshing ~4x tris -> default range
+      is now 48 (26.6 FPS bench; 32 -> 34 FPS, 64 -> 21 FPS).
+- [x] F2. Item drop entities (magnet pickup) + death drops materials (tools stay)
+- [x] F3. Hunger bar gating regen, starvation, eating fills food
+- [x] F4. Furnace + smelting (iron ingots, glass, cooked pork), iron tool/sword tier,
+      iron ore below y=20
+- [x] F5. Mob anatomy (legs, zombie arms) + walk animation, positional groans/oinks,
+      mobs persist in the save
+- [x] F6. Sand gravity (columns fall), sprint (SHIFT/L1), sneak with edge guard
+      (CTRL/CIRCLE)
+- [x] F7. Square sun, moon, stars; pause-menu RANGE/VOLUME rows, persisted in save
+
 **Phase D — dreams**
 - [ ] D1. LAN multiplayer (the laptop joins the den as player 2)
 - [ ] D2. Simple mobs (wandering animals; the Atom sets the population cap)
