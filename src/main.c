@@ -57,6 +57,20 @@ static const char *BLOCK_NAME[NBLOCKS] = {
     "sand", "water", "cobble", "coal",
 };
 
+/* survival design data, lifted from the Minecraft/MineClone2 tables.
+ * hardness = seconds to break by hand (stone-class softened to 3s until
+ * tools exist; MC's bare-hand 7.5s assumes you rush a wooden pickaxe). */
+static const float HARDNESS[NBLOCKS] = {
+    [B_GRASS] = 0.9f, [B_DIRT] = 0.75f, [B_STONE] = 3.0f,
+    [B_PLANKS] = 2.0f, [B_LOG] = 2.0f, [B_LEAVES] = 0.3f,
+    [B_SAND] = 0.75f, [B_COBBLE] = 3.0f, [B_COAL] = 3.0f,
+};
+static const BYTE DROPS[NBLOCKS] = {    /* what breaking yields */
+    [B_GRASS] = B_DIRT, [B_DIRT] = B_DIRT, [B_STONE] = B_COBBLE,
+    [B_PLANKS] = B_PLANKS, [B_LOG] = B_LOG, [B_LEAVES] = B_LEAVES,
+    [B_SAND] = B_SAND, [B_COBBLE] = B_COBBLE, [B_COAL] = B_COAL,
+};
+
 /* hotbar */
 static const BYTE HOTBAR[] = { B_GRASS, B_DIRT, B_STONE, B_PLANKS,
                                B_LOG, B_LEAVES, B_SAND, B_COBBLE };
@@ -118,6 +132,21 @@ static float g_step_dist;
 
 static int   g_hotbar_idx = 3;      /* start on planks */
 static int   g_sel = B_PLANKS;
+
+/* survival: inventory + block-breaking progress (fly mode = creative) */
+static int   g_inv[NBLOCKS];
+static int   g_break_on;            /* currently digging */
+static int   g_break_held;          /* dig input held this frame */
+static int   g_break_cell[3];
+static float g_break_prog;          /* 0..1 */
+static IDirect3DTexture9 *g_crack;
+
+/* particles */
+#define NPART 96
+static struct {
+    float x, y, z, vx, vy, vz, life;
+    int tile;
+} g_part[NPART];
 static int   g_remesh_ms;
 static float g_click_cd;
 static char  g_world_file[MAX_PATH];
@@ -811,12 +840,83 @@ static int raycast(int hit[3], int prev[3])
     return 0;
 }
 
+static void spawn_particles(int x, int y, int z, int blk, int n)
+{
+    int tile = TILE_FOR[blk][F_NORTH];
+    for (int i = 0; i < NPART && n; i++) {
+        if (g_part[i].life > 0) continue;
+        unsigned h = hash3u(x * 31 + i, y * 17 + n, z * 13);
+        g_part[i].x = x + 0.2f + (h & 63) / 100.0f;
+        g_part[i].y = y + 0.2f + ((h >> 6) & 63) / 100.0f;
+        g_part[i].z = z + 0.2f + ((h >> 12) & 63) / 100.0f;
+        g_part[i].vx = (((h >> 18) & 15) - 7.5f) * 0.35f;
+        g_part[i].vz = (((h >> 22) & 15) - 7.5f) * 0.35f;
+        g_part[i].vy = 2.0f + ((h >> 26) & 7) * 0.4f;
+        g_part[i].life = 0.5f + ((h >> 29) & 3) * 0.1f;
+        g_part[i].tile = tile;
+        n--;
+    }
+}
+
+static void update_particles(float dt)
+{
+    for (int i = 0; i < NPART; i++) {
+        if (g_part[i].life <= 0) continue;
+        g_part[i].life -= dt;
+        g_part[i].vy -= 18.0f * dt;
+        g_part[i].x += g_part[i].vx * dt;
+        g_part[i].y += g_part[i].vy * dt;
+        g_part[i].z += g_part[i].vz * dt;
+    }
+}
+
+static void break_complete(int x, int y, int z)
+{
+    int blk = block_at(x, y, z);
+    if (blk == B_AIR || blk == B_WATER) return;
+    set_block(x, y, z, B_AIR);
+    if (g_walk) {                       /* survival: the block drops */
+        g_inv[DROPS[blk]]++;
+        spawn_particles(x, y, z, blk, 10);
+    } else
+        spawn_particles(x, y, z, blk, 6);
+    play_sound(0);
+}
+
+/* creative (fly): instant break on click/hold */
 static void edit_break(void)
 {
     int hit[3], prev[3];
-    if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H) {
-        set_block(hit[0], hit[1], hit[2], B_AIR);
-        play_sound(0);
+    if (g_walk) return;                 /* survival digs via update_breaking */
+    if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H)
+        break_complete(hit[0], hit[1], hit[2]);
+}
+
+/* survival: hold-to-dig with per-block hardness */
+static void update_breaking(float dt, int held)
+{
+    int hit[3], prev[3];
+    if (!held || !g_walk || g_paused || !raycast(hit, prev) ||
+        hit[1] <= 0 || hit[1] >= WORLD_H) {
+        g_break_on = 0;
+        g_break_prog = 0;
+        return;
+    }
+    if (!g_break_on || hit[0] != g_break_cell[0] ||
+        hit[1] != g_break_cell[1] || hit[2] != g_break_cell[2]) {
+        g_break_on = 1;
+        g_break_cell[0] = hit[0];
+        g_break_cell[1] = hit[1];
+        g_break_cell[2] = hit[2];
+        g_break_prog = 0;
+    }
+    float hard = HARDNESS[block_at(hit[0], hit[1], hit[2])];
+    if (hard <= 0) hard = 1;
+    g_break_prog += dt / hard;
+    if (g_break_prog >= 1) {
+        break_complete(hit[0], hit[1], hit[2]);
+        g_break_on = 0;
+        g_break_prog = 0;
     }
 }
 
@@ -831,8 +931,27 @@ static void edit_place(void)
     if (prev[0] == ex && prev[2] == ez &&
         (prev[1] == ey || prev[1] == ey - 1))
         return;
+    if (g_walk) {                       /* survival: costs inventory */
+        if (g_inv[g_sel] <= 0) return;
+        g_inv[g_sel]--;
+    }
     set_block(prev[0], prev[1], prev[2], g_sel);
     play_sound(1);
+}
+
+/* the one recipe so far (MineClone2 data: 1 log -> 4 planks) */
+static void craft_planks(void)
+{
+    if (g_inv[B_LOG] >= 1) {
+        g_inv[B_LOG]--;
+        g_inv[B_PLANKS] += 4;
+        strcpy(g_toast, "+4 PLANKS (1 LOG)");
+        g_toast_t = 1.5f;
+        play_sound(1);
+    } else {
+        strcpy(g_toast, "NEED A LOG TO CRAFT PLANKS");
+        g_toast_t = 1.5f;
+    }
 }
 
 /* ------------------------------------------------------ player physics --- */
@@ -945,11 +1064,12 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x32435058 /* "XPC2" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x33435058 /* "XPC3" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
     fwrite(hdr, sizeof hdr, 1, fp);
     fwrite(st, sizeof st, 1, fp);
+    fwrite(g_inv, sizeof g_inv, 1, fp);
     fwrite(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
     fclose(fp);
     strcpy(g_toast, "WORLD SAVED");
@@ -962,12 +1082,20 @@ static int load_world(void)
     if (!fp) return 0;
     int hdr[4] = {0};
     float st[8];
-    if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != 0x32435058 ||
+    if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
+        (hdr[0] != 0x33435058 && hdr[0] != 0x32435058 /* v2 ok */) ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
         return 0;
     }
+    if (hdr[0] == 0x33435058) {         /* v3 carries the inventory */
+        if (fread(g_inv, sizeof g_inv, 1, fp) != 1) {
+            fclose(fp);
+            return 0;
+        }
+    } else
+        memset(g_inv, 0, sizeof g_inv);
     size_t ok = fread(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
     fclose(fp);
     if (ok != 1) return 0;
@@ -1175,6 +1303,41 @@ static int make_textures(void)
     return 1;
 }
 
+/* crack overlay: transparent texture with dark strands radiating outward */
+static int make_crack(void)
+{
+    if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TILE, TILE, 1, 0,
+                   D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_crack, NULL)))
+        return 0;
+    D3DLOCKED_RECT lr;
+    if (FAILED(IDirect3DTexture9_LockRect(g_crack, 0, &lr, NULL, 0)))
+        return 0;
+    for (int y = 0; y < TILE; y++) {
+        DWORD *row = (DWORD *)((BYTE *)lr.pBits + y * lr.Pitch);
+        for (int x = 0; x < TILE; x++)
+            row[x] = 0;
+    }
+    unsigned h = 0xC0FFEE;
+    for (int s = 0; s < 9; s++) {       /* 9 jagged strands from center */
+        float x = 32, y = 32;
+        h = h * 1664525u + 1013904223u;
+        float ang = (h >> 16 & 255) / 255.0f * 6.2832f;
+        for (int i = 0; i < 26; i++) {
+            h = h * 1664525u + 1013904223u;
+            ang += ((int)(h >> 16 & 31) - 15.5f) * 0.04f;
+            x += cosf(ang) * 1.3f;
+            y += sinf(ang) * 1.3f;
+            int ix = (int)x, iy = (int)y;
+            if (ix < 0 || iy < 0 || ix >= TILE || iy >= TILE) break;
+            DWORD *row = (DWORD *)((BYTE *)lr.pBits + iy * lr.Pitch);
+            row[ix] = D3DCOLOR_ARGB(210, 15, 12, 10);
+            if (ix + 1 < TILE) row[ix + 1] = D3DCOLOR_ARGB(140, 15, 12, 10);
+        }
+    }
+    IDirect3DTexture9_UnlockRect(g_crack, 0);
+    return 1;
+}
+
 /* GDI-rendered fixed-width font atlas: chars 32..127, 16x16 cells, 256x128 */
 static int make_font(void)
 {
@@ -1325,16 +1488,31 @@ static void draw_hotbar(void)
     for (int i = 0; i < NHOTBAR; i++) {
         DWORD frame = i == g_hotbar_idx ? D3DCOLOR_ARGB(230, 255, 255, 255)
                                         : D3DCOLOR_ARGB(140, 20, 20, 20);
+        int have = g_inv[HOTBAR[i]];
+        DWORD tint = (!g_walk || have > 0)
+                   ? D3DCOLOR_ARGB(255, 255, 255, 255)
+                   : D3DCOLOR_ARGB(255, 95, 95, 95);   /* out of stock */
         hud_quad(x - 3, y - 3, x + slot + 3, y + slot + 3, frame, NULL,
                  0, 0, 0, 0);
-        hud_quad(x, y, x + slot, y + slot, D3DCOLOR_ARGB(255, 255, 255, 255),
+        hud_quad(x, y, x + slot, y + slot, tint,
                  g_tex[TILE_FOR[HOTBAR[i]][F_NORTH]], 0, 0, 1, 1);
+        if (g_walk) {                   /* survival: show counts */
+            char cnt[8];
+            sprintf(cnt, "%d", have > 999 ? 999 : have);
+            draw_text(x + slot - (float)strlen(cnt) * g_glyph_w - 1,
+                      y + slot - 17, cnt,
+                      D3DCOLOR_ARGB(255, 255, 255, 160));
+        }
         x += slot + pad;
     }
-    /* selected block name above the bar */
-    const char *nm = BLOCK_NAME[g_sel];
-    float tx = (g_win_w - (float)strlen(nm) * g_glyph_w) / 2.0f;
-    draw_text(tx, y - 26, nm, D3DCOLOR_ARGB(220, 255, 255, 255));
+    /* selected block name (+count) above the bar */
+    char label[48];
+    if (g_walk)
+        sprintf(label, "%s x %d", BLOCK_NAME[g_sel], g_inv[g_sel]);
+    else
+        sprintf(label, "%s", BLOCK_NAME[g_sel]);
+    float tx = (g_win_w - (float)strlen(label) * g_glyph_w) / 2.0f;
+    draw_text(tx, y - 26, label, D3DCOLOR_ARGB(220, 255, 255, 255));
 }
 
 static void draw_crosshair(void)
@@ -1494,10 +1672,18 @@ static void update_gamepad_mapped(float dt)
     if (g_pitch >  1.55f) g_pitch =  1.55f;
     if (g_pitch < -1.55f) g_pitch = -1.55f;
 
-    if ((p.r2 || p.l2) && g_click_cd <= 0) {
-        if (p.r2) edit_break(); else edit_place();
+    if (p.r2) {
+        g_break_held = 1;               /* survival digs via progress */
+        if (!g_walk && g_click_cd <= 0) { edit_break(); g_click_cd = 0.22f; }
+    }
+    if (p.l2 && g_click_cd <= 0) {
+        edit_place();
         g_click_cd = 0.22f;
     }
+
+    static unsigned prev_tri;
+    if (p.triangle && !prev_tri) craft_planks();
+    prev_tri = p.triangle;
 
     if (p.square && !prev_sq) hotbar_step(1);
     if (p.l1 && !prev_l1) hotbar_step(-1);
@@ -1556,6 +1742,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_sel = HOTBAR[g_hotbar_idx];
         }
         else if (w == 'F') { g_walk = !g_walk; g_vel_y = 0; }
+        else if (w == 'C') craft_planks();
         else if (w == VK_F3) g_stats = !g_stats;
         else if (w == VK_F5) save_world();
         return 0;
@@ -1643,7 +1830,7 @@ static int init_d3d(HWND hwnd)
                                     D3DFOG_LINEAR);
     apply_range();
 
-    return make_textures() && make_font();
+    return make_textures() && make_font() && make_crack();
 }
 
 /* ------------------------------------------------------------ day/night -- */
@@ -1756,6 +1943,80 @@ static void render_frame(void)
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, TRUE);
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE, FALSE);
 
+        /* particles: camera-facing quads, grouped per tile texture */
+        {
+            float rxv = cosf(g_yaw) * 0.09f, rzv = -sinf(g_yaw) * 0.09f;
+            IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+            for (int t = 0; t < NTILES; t++) {
+                static VTX pv[NPART * 6];
+                int n = 0;
+                for (int i = 0; i < NPART; i++) {
+                    if (g_part[i].life <= 0 || g_part[i].tile != t)
+                        continue;
+                    float px = g_part[i].x, py = g_part[i].y,
+                          pz = g_part[i].z;
+                    DWORD col = D3DCOLOR_ARGB(255, 220, 220, 220);
+                    VTX q[6] = {
+                        { px - rxv, py + 0.09f, pz - rzv, col, 0.1f, 0.1f },
+                        { px + rxv, py + 0.09f, pz + rzv, col, 0.4f, 0.1f },
+                        { px + rxv, py - 0.09f, pz + rzv, col, 0.4f, 0.4f },
+                        { px - rxv, py + 0.09f, pz - rzv, col, 0.1f, 0.1f },
+                        { px + rxv, py - 0.09f, pz + rzv, col, 0.4f, 0.4f },
+                        { px - rxv, py - 0.09f, pz - rzv, col, 0.1f, 0.4f },
+                    };
+                    memcpy(&pv[n * 6], q, sizeof q);
+                    n++;
+                }
+                if (!n) continue;
+                IDirect3DDevice9_SetRenderState(g_dev, D3DRS_CULLMODE,
+                                                D3DCULL_NONE);
+                IDirect3DDevice9_SetTexture(g_dev, 0,
+                        (IDirect3DBaseTexture9 *)g_tex[t]);
+                IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST,
+                        n * 2, pv, sizeof(VTX));
+                IDirect3DDevice9_SetRenderState(g_dev, D3DRS_CULLMODE,
+                                                D3DCULL_CW);
+            }
+        }
+
+        /* crack overlay on the block being dug */
+        if (g_break_on && g_break_prog > 0.02f) {
+            VTX cv[36];
+            int bx = g_break_cell[0], by = g_break_cell[1],
+                bz = g_break_cell[2];
+            DWORD col = D3DCOLOR_ARGB((int)(g_break_prog * 255),
+                                      255, 255, 255);
+            float e = 0.006f;
+            int vi = 0;
+            for (int f = 0; f < 6; f++) {
+                float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+                VTX c4[4];
+                for (int k = 0; k < 4; k++) {
+                    const BYTE *o = FACES[f].c[k];
+                    c4[k].x = bx + (o[0] ? 1 + e : -e);
+                    c4[k].y = by + (o[1] ? 1 + e : -e);
+                    c4[k].z = bz + (o[2] ? 1 + e : -e);
+                    c4[k].color = col;
+                    c4[k].u = uv[k][0];
+                    c4[k].v = uv[k][1];
+                }
+                cv[vi++] = c4[0]; cv[vi++] = c4[1]; cv[vi++] = c4[2];
+                cv[vi++] = c4[0]; cv[vi++] = c4[2]; cv[vi++] = c4[3];
+            }
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE,
+                                            TRUE);
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE,
+                                            FALSE);
+            IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+            IDirect3DDevice9_SetTexture(g_dev, 0,
+                    (IDirect3DBaseTexture9 *)g_crack);
+            IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, 12,
+                                             cv, sizeof(VTX));
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, TRUE);
+            IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE,
+                                            FALSE);
+        }
+
         /* block highlight */
         int hit[3], prev[3];
         if (!g_bench && !g_paused && raycast(hit, prev)) {
@@ -1794,7 +2055,7 @@ static void render_frame(void)
                 sprintf(line, "FPS %.0f  R%.0f  TRIS %d  CH %d  %s  "
                         "X%.0f Y%.0f Z%.0f  %02d:%02d",
                         g_fps, g_range, g_drawn_tris,
-                        g_drawn_chunks, g_walk ? "WALK" : "FLY",
+                        g_drawn_chunks, g_walk ? "SURVIVAL" : "CREATIVE",
                         g_cam_x, g_cam_y, g_cam_z, hh, mm);
                 draw_text(8, 6, line, D3DCOLOR_ARGB(200, 255, 255, 255));
             }
@@ -2003,10 +2264,27 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_click_cd -= dt;
             g_move_s = g_move_f = g_move_u = 0;
             g_jump = 0;
+            g_break_held = 0;
             if (!g_paused) update_camera(dt, (float)td);
             update_gamepad(dt);
             if (!g_paused) {
                 if (dt > 0.1f) dt = 0.1f;
+                if (GetFocus() == g_hwnd &&
+                    (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+                    g_break_held = 1;
+                    if (!g_walk && g_click_cd <= 0) {
+                        edit_break();
+                        g_click_cd = 0.22f;
+                    }
+                }
+                if (GetFocus() == g_hwnd &&
+                    (GetAsyncKeyState(VK_RBUTTON) & 0x8000) &&
+                    g_click_cd <= 0) {
+                    edit_place();
+                    g_click_cd = 0.22f;
+                }
+                update_breaking(dt, g_break_held);
+                update_particles(dt);
                 step_player(dt);
                 g_autosave_t += dt;
                 if (g_autosave_t > AUTOSAVE_S) {
