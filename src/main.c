@@ -50,7 +50,9 @@ enum { B_AIR, B_GRASS, B_DIRT, B_STONE, B_PLANKS, B_LOG, B_LEAVES,
        B_SAND, B_WATER, B_COBBLE, B_COAL, NBLOCKS };
 /* non-block inventory items (tools auto-apply to their block class) */
 enum { I_STICK = NBLOCKS, I_WPICK, I_WAXE, I_WSHOVEL,
-       I_SPICK, I_SAXE, I_SSHOVEL, NITEMS };
+       I_SPICK, I_SAXE, I_SSHOVEL,
+       I_WSWORD, I_SSWORD, I_PORK, NITEMS };
+#define NITEMS_V5 (NBLOCKS + 7)    /* item count when save v5 was written */
 enum { CL_NONE, CL_SHOVEL, CL_PICK, CL_AXE };   /* tool class per block */
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
 enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE, T_PLANKS, T_LOG_SIDE,
@@ -149,7 +151,9 @@ static int   g_break_on;            /* currently digging */
 static int   g_break_held;          /* dig input held this frame */
 static int   g_break_cell[3];
 static float g_break_prog;          /* 0..1 */
+static float g_atk_cd;              /* melee swing cooldown */
 static IDirect3DTexture9 *g_crack;
+static IDirect3DTexture9 *g_mobtex[2];  /* pig, zombie */
 
 /* first-person hand: the held block swings while digging/placing */
 static float g_swing;               /* 0..1 animation phase */
@@ -165,6 +169,7 @@ static float g_fall_from = -1;      /* y where the current fall began */
 static float g_hurt_t;              /* red flash timer */
 static float g_regen_t, g_drown_t;
 static float g_spawn_x, g_spawn_y, g_spawn_z;
+static int   g_head_in_water;       /* eye truly submerged (HUD tint) */
 
 /* particles */
 #define NPART 96
@@ -942,21 +947,43 @@ static void break_complete(int x, int y, int z)
     play_sound(0);
 }
 
+static int ray_mob(void);               /* fwd (mob section) */
+static void attack_mob(int i);
+
 /* creative (fly): instant break on click/hold */
 static void edit_break(void)
 {
     int hit[3], prev[3];
     if (g_walk) return;                 /* survival digs via update_breaking */
+    int mi = ray_mob();
+    if (mi >= 0) {
+        attack_mob(mi);
+        swing_kick();
+        return;
+    }
     if (raycast(hit, prev) && hit[1] > 0 && hit[1] < WORLD_H) {
         break_complete(hit[0], hit[1], hit[2]);
         swing_kick();
     }
 }
 
-/* survival: hold-to-dig with per-block hardness */
+/* survival: hold-to-dig with per-block hardness; mobs take the swing first */
 static void update_breaking(float dt, int held)
 {
     int hit[3], prev[3];
+    if (held && g_walk) {
+        int mi = ray_mob();
+        if (mi >= 0) {                  /* melee instead of digging */
+            g_break_on = 0;
+            g_break_prog = 0;
+            if (g_atk_cd <= 0) {
+                attack_mob(mi);
+                g_atk_cd = 0.45f;
+                swing_kick();
+            }
+            return;
+        }
+    }
     if (!held || !g_walk || g_paused || !raycast(hit, prev) ||
         hit[1] <= 0 || hit[1] >= WORLD_H) {
         g_break_on = 0;
@@ -1025,6 +1052,9 @@ static const RECIPE RECIPES[] = {
     { "stone pickaxe", "3 cobble + 2 sticks", I_SPICK,  1, B_COBBLE, 3, I_STICK, 2 },
     { "stone axe",     "3 cobble + 2 sticks", I_SAXE,   1, B_COBBLE, 3, I_STICK, 2 },
     { "stone shovel",  "1 cobble + 2 sticks", I_SSHOVEL, 1, B_COBBLE, 1, I_STICK, 2 },
+    { "wood sword",    "2 planks + 1 stick",  I_WSWORD, 1, B_PLANKS, 2, I_STICK, 1 },
+    { "stone sword",   "2 cobble + 1 stick",  I_SSWORD, 1, B_COBBLE, 2, I_STICK, 1 },
+    { "eat porkchop",  "1 porkchop: +4 hearts", -1,     0, I_PORK,   1, -1, 0 },
 };
 #define NRECIPES ((int)(sizeof RECIPES / sizeof RECIPES[0]))
 
@@ -1043,8 +1073,14 @@ static void do_craft(const RECIPE *r)
     }
     g_inv[r->in1] -= r->n1;
     if (r->in2 >= 0) g_inv[r->in2] -= r->n2;
-    g_inv[r->out] += r->outn;
-    sprintf(g_toast, "CRAFTED %s", r->name);
+    if (r->out < 0) {                   /* food: heal instead of yield */
+        g_health += 8;
+        if (g_health > 20) g_health = 20;
+        strcpy(g_toast, "ATE A PORKCHOP (+4 HEARTS)");
+    } else {
+        g_inv[r->out] += r->outn;
+        sprintf(g_toast, "CRAFTED %s", r->name);
+    }
     g_toast_t = 1.5f;
     play_sound(1);
 }
@@ -1133,8 +1169,14 @@ static void step_player(float dt)
         if (was_falling) {
             g_on_ground = 1;
             if (g_fall_from >= 0) {         /* MC: blocks fallen - 3 */
+                /* ANY water at the feet on landing cancels the damage
+                 * (the pre-move g_in_water misses shallow splashdowns) */
+                int fx2 = (int)floorf(g_cam_x), fz2 = (int)floorf(g_cam_z);
+                int fy2 = (int)floorf(g_cam_y - EYE_H + 0.1f);
+                int wet = block_at(fx2, fy2, fz2) == B_WATER ||
+                          block_at(fx2, fy2 - 1, fz2) == B_WATER;
                 int dmg = (int)((g_fall_from - g_cam_y) - 3.0f);
-                if (dmg > 0) damage(dmg);
+                if (dmg > 0 && !wet) damage(dmg);
                 g_fall_from = -1;
             }
         }
@@ -1165,8 +1207,11 @@ static void update_survival(float dt)
         g_air = 10.0f;
         return;
     }
-    int head_in = block_at((int)floorf(g_cam_x), (int)floorf(g_cam_y),
+    /* drown only when the eye is clearly under the surface */
+    int head_in = block_at((int)floorf(g_cam_x),
+                           (int)floorf(g_cam_y + 0.15f),
                            (int)floorf(g_cam_z)) == B_WATER;
+    g_head_in_water = head_in;
     if (head_in) {
         g_air -= dt * (10.0f / 15.0f);      /* ~15s of breath */
         if (g_air <= 0) {
@@ -1191,6 +1236,226 @@ static void update_survival(float dt)
     }
 }
 
+/* ---------------------------------------------------------------- mobs --- */
+/* Two species, MC design data: pigs (passive, day ambience, drop porkchops)
+ * and zombies (20 hp, hunt at night, 2 hp melee, burn off at dawn).
+ * Player melee: hand 1 / wood sword 4 / stone sword 5 (auto-apply). */
+
+#define NMOBS 12
+enum { M_NONE, M_PIG, M_ZOMBIE };
+
+static struct {
+    int   type, hp, on_ground;
+    float x, y, z, yaw, vy;
+    float dir_t, atk_cd, hurt_t, flee_t;
+} g_mob[NMOBS];
+static float g_spawn_tick;
+static int   g_mob_freeze;          /* mobtest: statues for screenshots */
+static unsigned g_mrng = 12345;
+static unsigned mrng(void) { g_mrng = g_mrng * 1664525u + 1013904223u; return g_mrng >> 16; }
+
+/* mob AABB: half-width w, height h, position = feet center */
+static int mob_box_hits(float x, float y, float z, float w, float h)
+{
+    int x0 = (int)floorf(x - w), x1 = (int)floorf(x + w);
+    int y0 = (int)floorf(y), y1 = (int)floorf(y + h - 0.01f);
+    int z0 = (int)floorf(z - w), z1 = (int)floorf(z + w);
+    for (int yy = y0; yy <= y1; yy++)
+        for (int zz = z0; zz <= z1; zz++)
+            for (int xx = x0; xx <= x1; xx++)
+                if (solid_block(block_at(xx, yy, zz)))
+                    return 1;
+    return 0;
+}
+
+static int mob_move(int i, float dx, float dy, float dz, float w, float h)
+{
+    int blocked = 0;
+    g_mob[i].x += dx;
+    if (mob_box_hits(g_mob[i].x, g_mob[i].y, g_mob[i].z, w, h)) {
+        g_mob[i].x -= dx;
+        blocked = 1;
+    }
+    g_mob[i].z += dz;
+    if (mob_box_hits(g_mob[i].x, g_mob[i].y, g_mob[i].z, w, h)) {
+        g_mob[i].z -= dz;
+        blocked = 1;
+    }
+    g_mob[i].y += dy;
+    if (mob_box_hits(g_mob[i].x, g_mob[i].y, g_mob[i].z, w, h)) {
+        g_mob[i].y -= dy;
+        if (dy < 0) g_mob[i].on_ground = 1;
+        g_mob[i].vy = 0;
+    } else if (dy != 0)
+        g_mob[i].on_ground = 0;
+    return blocked;
+}
+
+static int surface_y(int x, int z)
+{
+    for (int y = WORLD_H - 2; y > 0; y--)
+        if (solid_block(block_at(x, y, z)))
+            return y + 1;
+    return -1;
+}
+
+static void mob_spawn(int type, float x, float y, float z)
+{
+    for (int i = 0; i < NMOBS; i++) {
+        if (g_mob[i].type) continue;
+        g_mob[i].type = type;
+        g_mob[i].hp = type == M_ZOMBIE ? 20 : 10;
+        g_mob[i].x = x; g_mob[i].y = y; g_mob[i].z = z;
+        g_mob[i].yaw = (mrng() % 628) / 100.0f;
+        g_mob[i].vy = 0;
+        g_mob[i].dir_t = 1;
+        g_mob[i].atk_cd = g_mob[i].hurt_t = g_mob[i].flee_t = 0;
+        return;
+    }
+}
+
+static void update_mobs(float dt)
+{
+    /* population control, every 2s */
+    g_spawn_tick += dt;
+    if (g_spawn_tick > 2.0f) {
+        g_spawn_tick = 0;
+        int pigs = 0, zombies = 0;
+        for (int i = 0; i < NMOBS; i++) {
+            if (g_mob[i].type == M_PIG) pigs++;
+            if (g_mob[i].type == M_ZOMBIE) zombies++;
+            if (g_mob[i].type) {        /* distance despawn */
+                float dx = g_mob[i].x - g_cam_x, dz = g_mob[i].z - g_cam_z;
+                if (dx * dx + dz * dz > 70 * 70) g_mob[i].type = M_NONE;
+            }
+        }
+        int day = g_daylight > 0.6f;
+        int want = day ? M_PIG : M_ZOMBIE;
+        if ((want == M_PIG && pigs < 4) || (want == M_ZOMBIE && zombies < 6)) {
+            float ang = (mrng() % 628) / 100.0f;
+            float d = 22 + mrng() % 18;
+            int sx = (int)(g_cam_x + sinf(ang) * d);
+            int sz = (int)(g_cam_z + cosf(ang) * d);
+            if (sx > 1 && sz > 1 && sx < WX - 1 && sz < WZ - 1) {
+                int sy = surface_y(sx, sz);
+                if (sy > 0 && block_at(sx, sy, sz) == B_AIR &&
+                    block_at(sx, sy - 1, sz) != B_WATER)
+                    mob_spawn(want, sx + 0.5f, (float)sy, sz + 0.5f);
+            }
+        }
+    }
+
+    for (int i = 0; i < NMOBS; i++) {
+        if (!g_mob[i].type) continue;
+        if (g_mob_freeze) continue;
+        float w = 0.3f, h = g_mob[i].type == M_ZOMBIE ? 1.8f : 0.9f;
+        float speed = 0;                /* idle unless the AI says walk */
+
+        if (g_mob[i].hurt_t > 0) g_mob[i].hurt_t -= dt;
+        if (g_mob[i].atk_cd > 0) g_mob[i].atk_cd -= dt;
+        if (g_mob[i].flee_t > 0) g_mob[i].flee_t -= dt;
+
+        float pdx = g_cam_x - g_mob[i].x, pdz = g_cam_z - g_mob[i].z;
+        float pdist = sqrtf(pdx * pdx + pdz * pdz);
+
+        /* wander: alternate walk legs (dir_t > 0) and idle (dir_t < 0) */
+        if ((g_mob[i].dir_t -= dt) <= -(2 + (int)(mrng() % 3))) {
+            g_mob[i].dir_t = 1 + mrng() % 3;    /* new walk leg */
+            g_mob[i].yaw = (mrng() % 628) / 100.0f;
+        }
+        if (g_mob[i].dir_t > 0) speed = 1.2f;
+
+        if (g_mob[i].type == M_ZOMBIE) {
+            if (g_daylight > 0.7f) {    /* burns off in daylight */
+                g_mob[i].type = M_NONE;
+                continue;
+            }
+            if (pdist < 20 && g_walk && !g_dead) {
+                g_mob[i].yaw = atan2f(pdx, pdz);
+                speed = 2.3f;
+                if (pdist < 1.5f && g_mob[i].atk_cd <= 0) {
+                    g_mob[i].atk_cd = 1.0f;
+                    damage(2);
+                }
+            }
+        } else if (g_mob[i].flee_t > 0) {       /* smacked pig runs */
+            g_mob[i].yaw = atan2f(-pdx, -pdz);
+            speed = 2.6f;
+        }
+
+        g_mob[i].vy -= GRAVITY * dt;
+        if (g_mob[i].vy < -30) g_mob[i].vy = -30;
+        int blocked = mob_move(i, sinf(g_mob[i].yaw) * speed * dt,
+                               g_mob[i].vy * dt,
+                               cosf(g_mob[i].yaw) * speed * dt, w, h);
+        if (blocked && speed > 0 && g_mob[i].on_ground)
+            g_mob[i].vy = 7.5f;         /* hop up the ledge */
+        if (g_mob[i].y < 1) g_mob[i].type = M_NONE;   /* fell out */
+    }
+}
+
+/* ray vs mob AABBs: returns mob index within reach of the view ray, or -1 */
+static int ray_mob(void)
+{
+    float dx, dy, dz;
+    cam_dir(&dx, &dy, &dz);
+    int best = -1;
+    float bt = REACH;
+    for (int i = 0; i < NMOBS; i++) {
+        if (!g_mob[i].type) continue;
+        float w = 0.4f, h = g_mob[i].type == M_ZOMBIE ? 1.8f : 0.9f;
+        float lo[3] = { g_mob[i].x - w, g_mob[i].y, g_mob[i].z - w };
+        float hi[3] = { g_mob[i].x + w, g_mob[i].y + h, g_mob[i].z + w };
+        float o[3] = { g_cam_x, g_cam_y, g_cam_z };
+        float d[3] = { dx, dy, dz };
+        float tmin = 0, tmax = bt;
+        int ok = 1;
+        for (int a = 0; a < 3 && ok; a++) {
+            if (d[a] == 0) {
+                if (o[a] < lo[a] || o[a] > hi[a]) ok = 0;
+            } else {
+                float t1 = (lo[a] - o[a]) / d[a];
+                float t2 = (hi[a] - o[a]) / d[a];
+                if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+                if (tmin > tmax) ok = 0;
+            }
+        }
+        if (ok && tmin < bt) {
+            bt = tmin;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void attack_mob(int i)
+{
+    int dmg = 1;                        /* bare hand */
+    if (g_inv[I_SSWORD]) dmg = 5;
+    else if (g_inv[I_WSWORD]) dmg = 4;
+    if (!g_walk) dmg = 20;              /* creative one-shots */
+    g_mob[i].hp -= dmg;
+    g_mob[i].hurt_t = 0.4f;
+    g_mob[i].flee_t = 4.0f;
+    play_sound(4);
+    /* knockback */
+    float kx = g_mob[i].x - g_cam_x, kz = g_mob[i].z - g_cam_z;
+    float kl = sqrtf(kx * kx + kz * kz);
+    if (kl > 0.01f) {
+        float w = 0.3f, h = g_mob[i].type == M_ZOMBIE ? 1.8f : 0.9f;
+        mob_move(i, kx / kl * 0.5f, 0, kz / kl * 0.5f, w, h);
+        g_mob[i].vy = 4.0f;
+    }
+    if (g_mob[i].hp <= 0) {
+        if (g_mob[i].type == M_PIG && g_walk)
+            g_inv[I_PORK] += 1 + (mrng() & 1);
+        g_mob[i].type = M_NONE;
+        play_sound(0);
+    }
+}
+
 /* --------------------------------------------------------- save / load --- */
 
 static void world_file_path(void)
@@ -1205,7 +1470,7 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x35435058 /* "XPC5" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x36435058 /* "XPC6" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
     float ext[5] = { g_spawn_x, g_spawn_y, g_spawn_z,
@@ -1227,8 +1492,7 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        (hdr[0] != 0x35435058 && hdr[0] != 0x34435058 &&
-         hdr[0] != 0x33435058 && hdr[0] != 0x32435058) ||
+        hdr[0] < 0x32435058 || hdr[0] > 0x36435058 ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1236,9 +1500,10 @@ static int load_world(void)
     }
     memset(g_inv, 0, sizeof g_inv);
     g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
-    if (hdr[0] >= 0x34435058) {         /* v4/v5: spawn + vitals */
+    if (hdr[0] >= 0x34435058) {         /* v4+: spawn + vitals */
         float ext[5];
-        int ninv = hdr[0] == 0x35435058 ? NITEMS : NBLOCKS;
+        int ninv = hdr[0] >= 0x36435058 ? NITEMS
+                 : hdr[0] == 0x35435058 ? NITEMS_V5 : NBLOCKS;
         if (fread(ext, sizeof ext, 1, fp) != 1 ||
             fread(g_inv, sizeof(int) * ninv, 1, fp) != 1) {
             fclose(fp);
@@ -1499,6 +1764,39 @@ static int make_crack(void)
         }
     }
     IDirect3DTexture9_UnlockRect(g_crack, 0);
+    return 1;
+}
+
+/* mob skins: 0 = pig (pink, mud patches), 1 = zombie (green, dark brow) */
+static int make_mobtex(void)
+{
+    for (int t = 0; t < 2; t++) {
+        if (FAILED(IDirect3DDevice9_CreateTexture(g_dev, TILE, TILE, 1, 0,
+                       D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_mobtex[t], NULL)))
+            return 0;
+        D3DLOCKED_RECT lr;
+        if (FAILED(IDirect3DTexture9_LockRect(g_mobtex[t], 0, &lr, NULL, 0)))
+            return 0;
+        for (int y = 0; y < TILE; y++) {
+            DWORD *row = (DWORD *)((BYTE *)lr.pBits + y * lr.Pitch);
+            for (int x = 0; x < TILE; x++) {
+                int n = (int)(rng() % 28), r, g, b;
+                if (t == 0) {
+                    r = 232 + n - 14; g = 152 + n - 14; b = 160 + n - 14;
+                    if (((x / 9) * 13 + (y / 9) * 7) % 11 == 0)
+                        { r -= 60; g -= 50; b -= 45; }   /* mud */
+                } else {
+                    r = 60 + n / 2; g = 140 + n; b = 60 + n / 2;
+                    if (y > 14 && y < 24 && (x % 16) > 3 && (x % 16) < 12)
+                        { r = 25; g = 45; b = 30; }      /* dark brow band */
+                }
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                row[x] = D3DCOLOR_ARGB(255, r, g, b);
+            }
+        }
+        IDirect3DTexture9_UnlockRect(g_mobtex[t], 0);
+    }
     return 1;
 }
 
@@ -1793,8 +2091,9 @@ static void apply_range(void)
 {
     float zf = g_range * 1.4f;
     if (zf < 120) zf = 120;
+    /* near 0.12: at 0.3 the frustum corners cut into walls you hug */
     D3DMATRIX proj = mat_perspective(1.22f, (float)g_win_w / g_win_h,
-                                     0.3f, zf);
+                                     0.12f, zf);
     IDirect3DDevice9_SetTransform(g_dev, D3DTS_PROJECTION, &proj);
     union { float f; DWORD d; } fs = { g_range * 0.55f },
                                 fe = { g_range * 0.98f };
@@ -2102,7 +2401,7 @@ static int init_d3d(HWND hwnd)
                                     D3DFOG_LINEAR);
     apply_range();
 
-    return make_textures() && make_font() && make_crack();
+    return make_textures() && make_font() && make_crack() && make_mobtex();
 }
 
 /* ------------------------------------------------------------ day/night -- */
@@ -2130,6 +2429,63 @@ static void update_daylight(float dt)
     int li = (int)(L * 255);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_TEXTUREFACTOR,
                                     D3DCOLOR_ARGB(255, li, li, li));
+}
+
+/* mob-local textured box: center c, half-extents e, into 36 verts */
+static int emit_box(VTX *v, float cx, float cy, float cz,
+                    float ex, float ey, float ez, int hurt)
+{
+    int vi = 0;
+    for (int f = 0; f < 6; f++) {
+        int s = 255 * FACES[f].shade / 100;
+        DWORD col = hurt ? D3DCOLOR_ARGB(255, s, s / 3, s / 3)
+                         : D3DCOLOR_ARGB(255, s, s, s);
+        float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+        VTX c4[4];
+        for (int k = 0; k < 4; k++) {
+            const BYTE *o = FACES[f].c[k];
+            c4[k].x = cx + (o[0] ? ex : -ex);
+            c4[k].y = cy + (o[1] ? ey : -ey);
+            c4[k].z = cz + (o[2] ? ez : -ez);
+            c4[k].color = col;
+            c4[k].u = uv[k][0];
+            c4[k].v = uv[k][1];
+        }
+        v[vi++] = c4[0]; v[vi++] = c4[1]; v[vi++] = c4[2];
+        v[vi++] = c4[0]; v[vi++] = c4[2]; v[vi++] = c4[3];
+    }
+    return vi;
+}
+
+static void draw_mobs(void)
+{
+    IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+    for (int i = 0; i < NMOBS; i++) {
+        if (!g_mob[i].type) continue;
+        float dx = g_mob[i].x - g_cam_x, dz = g_mob[i].z - g_cam_z;
+        if (dx * dx + dz * dz > g_range * g_range) continue;
+
+        D3DMATRIX r = mat_rot_y(g_mob[i].yaw);
+        D3DMATRIX t = mat_translate(g_mob[i].x, g_mob[i].y, g_mob[i].z);
+        D3DMATRIX m = mat_mul(&r, &t);
+        IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &m);
+
+        VTX mv[72];
+        int n, hurt = g_mob[i].hurt_t > 0;
+        if (g_mob[i].type == M_PIG) {
+            n  = emit_box(mv, 0, 0.50f, 0, 0.30f, 0.25f, 0.45f, hurt);
+            n += emit_box(mv + n, 0, 0.62f, 0.55f, 0.22f, 0.22f, 0.20f, hurt);
+        } else {
+            n  = emit_box(mv, 0, 0.55f, 0, 0.25f, 0.55f, 0.15f, hurt);
+            n += emit_box(mv + n, 0, 1.34f, 0, 0.24f, 0.24f, 0.24f, hurt);
+        }
+        IDirect3DDevice9_SetTexture(g_dev, 0,
+            (IDirect3DBaseTexture9 *)g_mobtex[g_mob[i].type == M_PIG ? 0 : 1]);
+        IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, n / 3,
+                                         mv, sizeof(VTX));
+    }
+    D3DMATRIX ident = mat_identity();
+    IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &ident);
 }
 
 /* -------------------------------------------------------------- render --- */
@@ -2214,6 +2570,8 @@ static void render_frame(void)
         }
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, TRUE);
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE, FALSE);
+
+        if (!g_bench) draw_mobs();
 
         /* particles: camera-facing quads, grouped per tile texture */
         {
@@ -2363,6 +2721,9 @@ static void render_frame(void)
         /* ------------------------------------------------------- HUD ----- */
         if (!g_bench) {
             hud_begin();
+            if (g_head_in_water)        /* underwater tint */
+                hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
+                         D3DCOLOR_ARGB(85, 30, 70, 160), NULL, 0, 0, 0, 0);
             if (g_hurt_t > 0)           /* red damage flash */
                 hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
                          D3DCOLOR_ARGB((int)(g_hurt_t / 0.35f * 110),
@@ -2559,6 +2920,25 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         }
     }
 
+    if (cmdline && strstr(cmdline, "mobtest")) {   /* dev: critters up close */
+        for (int i = 0; i < 6; i++) {              /* ring, standing still */
+            float ang = g_yaw + (i - 2.5f) * 0.35f;
+            float mx = g_cam_x + sinf(ang) * 6;
+            float mz = g_cam_z + cosf(ang) * 6;
+            int sy = surface_y((int)mx, (int)mz);
+            if (sy > 0)
+                mob_spawn(i & 1 ? M_ZOMBIE : M_PIG, mx, (float)sy + 0.1f, mz);
+        }
+        g_mob_freeze = 1;                          /* statues */
+        for (int i = 0; i < NMOBS; i++)
+            if (g_mob[i].type)
+                g_mob[i].yaw = g_yaw + 3.14159f;   /* face the camera */
+        int cy = surface_y((int)g_cam_x, (int)g_cam_z);
+        if (cy > 0) g_cam_y = cy + 2.4f;
+        g_pitch = 0.22f;
+        g_walk = 0;
+    }
+
     loading_frame("BUILDING MESHES...");
     InitializeCriticalSection(&g_qlock);
     g_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -2592,6 +2972,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_pitch = 0.15f;
         } else {
             g_click_cd -= dt;
+            g_atk_cd -= dt;
             g_move_s = g_move_f = g_move_u = 0;
             g_jump = 0;
             g_break_held = 0;
@@ -2625,6 +3006,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
                 update_particles(dt);
                 step_player(dt);
                 update_survival(dt);
+                update_mobs(dt);
                 g_autosave_t += dt;
                 if (g_autosave_t > AUTOSAVE_S) {
                     g_autosave_t = 0;
@@ -2677,6 +3059,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
     for (int t = 0; t < NTILES; t++)
         if (g_tex[t]) IDirect3DTexture9_Release(g_tex[t]);
     if (g_font) IDirect3DTexture9_Release(g_font);
+    if (g_crack) IDirect3DTexture9_Release(g_crack);
+    for (int t = 0; t < 2; t++)
+        if (g_mobtex[t]) IDirect3DTexture9_Release(g_mobtex[t]);
     if (g_dev) IDirect3DDevice9_Release(g_dev);
     if (g_d3d) IDirect3D9_Release(g_d3d);
     for (int i = 0; i < 4; i++)
