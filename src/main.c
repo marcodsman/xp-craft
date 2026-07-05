@@ -48,6 +48,10 @@
 
 enum { B_AIR, B_GRASS, B_DIRT, B_STONE, B_PLANKS, B_LOG, B_LEAVES,
        B_SAND, B_WATER, B_COBBLE, B_COAL, NBLOCKS };
+/* non-block inventory items (tools auto-apply to their block class) */
+enum { I_STICK = NBLOCKS, I_WPICK, I_WAXE, I_WSHOVEL,
+       I_SPICK, I_SAXE, I_SSHOVEL, NITEMS };
+enum { CL_NONE, CL_SHOVEL, CL_PICK, CL_AXE };   /* tool class per block */
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
 enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE, T_PLANKS, T_LOG_SIDE,
        T_LOG_TOP, T_LEAVES, T_SAND, T_WATER, T_COBBLE, T_COAL, NTILES };
@@ -58,12 +62,17 @@ static const char *BLOCK_NAME[NBLOCKS] = {
 };
 
 /* survival design data, lifted from the Minecraft/MineClone2 tables.
- * hardness = seconds to break by hand (stone-class softened to 3s until
- * tools exist; MC's bare-hand 7.5s assumes you rush a wooden pickaxe). */
-static const float HARDNESS[NBLOCKS] = {
-    [B_GRASS] = 0.9f, [B_DIRT] = 0.75f, [B_STONE] = 3.0f,
-    [B_PLANKS] = 2.0f, [B_LOG] = 2.0f, [B_LEAVES] = 0.3f,
-    [B_SAND] = 0.75f, [B_COBBLE] = 3.0f, [B_COAL] = 3.0f,
+ * Real MC base hardness now that tools exist. Break time: hand = 1.5*H
+ * (5*H for pick-class blocks), wood tool = 1.5*H/2, stone tool = 1.5*H/4. */
+static const float HARD_BASE[NBLOCKS] = {
+    [B_GRASS] = 0.6f, [B_DIRT] = 0.5f, [B_STONE] = 1.5f,
+    [B_PLANKS] = 2.0f, [B_LOG] = 2.0f, [B_LEAVES] = 0.2f,
+    [B_SAND] = 0.5f, [B_COBBLE] = 2.0f, [B_COAL] = 3.0f,
+};
+static const BYTE BLOCK_CLASS[NBLOCKS] = {
+    [B_GRASS] = CL_SHOVEL, [B_DIRT] = CL_SHOVEL, [B_SAND] = CL_SHOVEL,
+    [B_STONE] = CL_PICK, [B_COBBLE] = CL_PICK, [B_COAL] = CL_PICK,
+    [B_PLANKS] = CL_AXE, [B_LOG] = CL_AXE,
 };
 static const BYTE DROPS[NBLOCKS] = {    /* what breaking yields */
     [B_GRASS] = B_DIRT, [B_DIRT] = B_DIRT, [B_STONE] = B_COBBLE,
@@ -134,7 +143,8 @@ static int   g_hotbar_idx = 3;      /* start on planks */
 static int   g_sel = B_PLANKS;
 
 /* survival: inventory + block-breaking progress (fly mode = creative) */
-static int   g_inv[NBLOCKS];
+static int   g_inv[NITEMS];
+static int   g_craft_open, g_craft_sel;
 static int   g_break_on;            /* currently digging */
 static int   g_break_held;          /* dig input held this frame */
 static int   g_break_cell[3];
@@ -961,8 +971,20 @@ static void update_breaking(float dt, int held)
         g_break_cell[2] = hit[2];
         g_break_prog = 0;
     }
-    float hard = HARDNESS[block_at(hit[0], hit[1], hit[2])];
-    if (hard <= 0) hard = 1;
+    float hard = 1;                     /* set below via break_time */
+    {
+        int blk = block_at(hit[0], hit[1], hit[2]);
+        float H = HARD_BASE[blk];
+        if (H <= 0) H = 0.2f;
+        int cls = BLOCK_CLASS[blk];
+        int wood = 0, stone = 0;
+        if (cls == CL_PICK)   { wood = g_inv[I_WPICK];   stone = g_inv[I_SPICK]; }
+        if (cls == CL_AXE)    { wood = g_inv[I_WAXE];    stone = g_inv[I_SAXE]; }
+        if (cls == CL_SHOVEL) { wood = g_inv[I_WSHOVEL]; stone = g_inv[I_SSHOVEL]; }
+        if (stone > 0)      hard = 1.5f * H / 4.0f;
+        else if (wood > 0)  hard = 1.5f * H / 2.0f;
+        else                hard = (cls == CL_PICK ? 5.0f : 1.5f) * H;
+    }
     g_break_prog += dt / hard;
     if (g_break_prog >= 1) {
         break_complete(hit[0], hit[1], hit[2]);
@@ -991,19 +1013,40 @@ static void edit_place(void)
     swing_kick();
 }
 
-/* the one recipe so far (MineClone2 data: 1 log -> 4 planks) */
-static void craft_planks(void)
+/* crafting: shapeless-ified MC recipes */
+typedef struct { const char *name, *cost; int out, outn, in1, n1, in2, n2; }
+    RECIPE;
+static const RECIPE RECIPES[] = {
+    { "4 planks",      "1 log",              B_PLANKS,  4, B_LOG,    1, -1, 0 },
+    { "4 sticks",      "2 planks",           I_STICK,   4, B_PLANKS, 2, -1, 0 },
+    { "wood pickaxe",  "3 planks + 2 sticks", I_WPICK,  1, B_PLANKS, 3, I_STICK, 2 },
+    { "wood axe",      "3 planks + 2 sticks", I_WAXE,   1, B_PLANKS, 3, I_STICK, 2 },
+    { "wood shovel",   "1 plank + 2 sticks",  I_WSHOVEL, 1, B_PLANKS, 1, I_STICK, 2 },
+    { "stone pickaxe", "3 cobble + 2 sticks", I_SPICK,  1, B_COBBLE, 3, I_STICK, 2 },
+    { "stone axe",     "3 cobble + 2 sticks", I_SAXE,   1, B_COBBLE, 3, I_STICK, 2 },
+    { "stone shovel",  "1 cobble + 2 sticks", I_SSHOVEL, 1, B_COBBLE, 1, I_STICK, 2 },
+};
+#define NRECIPES ((int)(sizeof RECIPES / sizeof RECIPES[0]))
+
+static int can_craft(const RECIPE *r)
 {
-    if (g_inv[B_LOG] >= 1) {
-        g_inv[B_LOG]--;
-        g_inv[B_PLANKS] += 4;
-        strcpy(g_toast, "+4 PLANKS (1 LOG)");
-        g_toast_t = 1.5f;
-        play_sound(1);
-    } else {
-        strcpy(g_toast, "NEED A LOG TO CRAFT PLANKS");
-        g_toast_t = 1.5f;
+    return g_inv[r->in1] >= r->n1 &&
+           (r->in2 < 0 || g_inv[r->in2] >= r->n2);
+}
+
+static void do_craft(const RECIPE *r)
+{
+    if (!can_craft(r)) {
+        strcpy(g_toast, "MISSING INGREDIENTS");
+        g_toast_t = 1.2f;
+        return;
     }
+    g_inv[r->in1] -= r->n1;
+    if (r->in2 >= 0) g_inv[r->in2] -= r->n2;
+    g_inv[r->out] += r->outn;
+    sprintf(g_toast, "CRAFTED %s", r->name);
+    g_toast_t = 1.5f;
+    play_sound(1);
 }
 
 /* ------------------------------------------------------ player physics --- */
@@ -1162,7 +1205,7 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x34435058 /* "XPC4" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x35435058 /* "XPC5" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
     float ext[5] = { g_spawn_x, g_spawn_y, g_spawn_z,
@@ -1184,8 +1227,8 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        (hdr[0] != 0x34435058 && hdr[0] != 0x33435058 &&
-         hdr[0] != 0x32435058) ||
+        (hdr[0] != 0x35435058 && hdr[0] != 0x34435058 &&
+         hdr[0] != 0x33435058 && hdr[0] != 0x32435058) ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1193,10 +1236,11 @@ static int load_world(void)
     }
     memset(g_inv, 0, sizeof g_inv);
     g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
-    if (hdr[0] == 0x34435058) {         /* v4: spawn + vitals */
+    if (hdr[0] >= 0x34435058) {         /* v4/v5: spawn + vitals */
         float ext[5];
+        int ninv = hdr[0] == 0x35435058 ? NITEMS : NBLOCKS;
         if (fread(ext, sizeof ext, 1, fp) != 1 ||
-            fread(g_inv, sizeof g_inv, 1, fp) != 1) {
+            fread(g_inv, sizeof(int) * ninv, 1, fp) != 1) {
             fclose(fp);
             return 0;
         }
@@ -1204,8 +1248,8 @@ static int load_world(void)
         g_health = (int)ext[3];
         g_air = ext[4];
         if (g_health <= 0 || g_health > 20) g_health = 20;
-    } else if (hdr[0] == 0x33435058) {  /* v3: inventory only */
-        if (fread(g_inv, sizeof g_inv, 1, fp) != 1) {
+    } else if (hdr[0] == 0x33435058) {  /* v3: block inventory only */
+        if (fread(g_inv, sizeof(int) * NBLOCKS, 1, fp) != 1) {
             fclose(fp);
             return 0;
         }
@@ -1669,6 +1713,39 @@ static void draw_health(void)
     }
 }
 
+static void draw_craft(void)
+{
+    float w = 460, h = 90 + NRECIPES * 26;
+    float x0 = (g_win_w - w) / 2, y0 = (g_win_h - h) / 2;
+    hud_quad(x0, y0, x0 + w, y0 + h, D3DCOLOR_ARGB(215, 10, 12, 22),
+             NULL, 0, 0, 0, 0);
+    char hdr[64];
+    sprintf(hdr, "CRAFTING   (sticks x %d)", g_inv[I_STICK]);
+    draw_text(x0 + 18, y0 + 12, hdr, D3DCOLOR_ARGB(255, 255, 255, 255));
+
+    float y = y0 + 46;
+    for (int i = 0; i < NRECIPES; i++) {
+        const RECIPE *r = &RECIPES[i];
+        int ok = can_craft(r);
+        char line[96];
+        int have = g_inv[r->out];
+        sprintf(line, "%s%-14s %-21s%s", i == g_craft_sel ? "> " : "  ",
+                r->name, r->cost, have ? "" : "");
+        DWORD col = !ok ? D3DCOLOR_ARGB(160, 120, 120, 130)
+                  : i == g_craft_sel ? D3DCOLOR_ARGB(255, 255, 230, 120)
+                                     : D3DCOLOR_ARGB(230, 210, 210, 220);
+        draw_text(x0 + 18, y, line, col);
+        if (have) {
+            char hv[16];
+            sprintf(hv, "x%d", have);
+            draw_text(x0 + w - 60, y, hv, D3DCOLOR_ARGB(200, 160, 220, 160));
+        }
+        y += 26;
+    }
+    draw_text(x0 + 18, y + 8, "CROSS/ENTER craft   CIRCLE/ESC close",
+              D3DCOLOR_ARGB(170, 160, 160, 175));
+}
+
 static void draw_death(void)
 {
     hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
@@ -1809,6 +1886,18 @@ static void update_gamepad_mapped(float dt)
         prev_cross = p.cross; prev_start = p.start;
         return;
     }
+    if (g_craft_open) {                 /* crafting menu */
+        static unsigned prev_tri2;
+        if (p.up && !prev_up)
+            g_craft_sel = (g_craft_sel + NRECIPES - 1) % NRECIPES;
+        if (p.down && !prev_down) g_craft_sel = (g_craft_sel + 1) % NRECIPES;
+        if (p.cross && !prev_cross) do_craft(&RECIPES[g_craft_sel]);
+        if (p.circle || (p.triangle && !prev_tri2)) g_craft_open = 0;
+        prev_tri2 = p.triangle;
+        prev_up = p.up; prev_down = p.down;
+        prev_cross = p.cross;
+        return;
+    }
 
     float strafe  = p.lx + (p.right ? 1.0f : 0) - (p.left ? 1.0f : 0);
     float forward = p.ly + (p.up ? 1.0f : 0) - (p.down ? 1.0f : 0);
@@ -1853,7 +1942,7 @@ static void update_gamepad_mapped(float dt)
     }
 
     static unsigned prev_tri;
-    if (p.triangle && !prev_tri) craft_planks();
+    if (p.triangle && !prev_tri) { g_craft_open = 1; g_craft_sel = 0; }
     prev_tri = p.triangle;
 
     if (p.square && !prev_sq) hotbar_step(1);
@@ -1908,6 +1997,14 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (w == VK_ESCAPE) g_paused = 0;
             return 0;
         }
+        if (g_craft_open) {
+            if (w == VK_UP)
+                g_craft_sel = (g_craft_sel + NRECIPES - 1) % NRECIPES;
+            if (w == VK_DOWN)   g_craft_sel = (g_craft_sel + 1) % NRECIPES;
+            if (w == VK_RETURN) do_craft(&RECIPES[g_craft_sel]);
+            if (w == VK_ESCAPE || w == 'C') g_craft_open = 0;
+            return 0;
+        }
         if (w == VK_ESCAPE) {
             if (g_bench) DestroyWindow(h);
             else { g_paused = 1; g_menu_sel = 0; }
@@ -1917,7 +2014,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_sel = HOTBAR[g_hotbar_idx];
         }
         else if (w == 'F') { g_walk = !g_walk; g_vel_y = 0; }
-        else if (w == 'C') craft_planks();
+        else if (w == 'C') { g_craft_open = 1; g_craft_sel = 0; }
         else if (w == VK_F3) g_stats = !g_stats;
         else if (w == VK_F5) save_world();
         return 0;
@@ -2292,6 +2389,7 @@ static void render_frame(void)
                 draw_text(tx, g_win_h * 0.32f, g_toast,
                           D3DCOLOR_ARGB(240, 255, 240, 150));
             }
+            if (g_craft_open) draw_craft();
             if (g_paused) draw_menu();
             if (g_dead) draw_death();
             hud_end();
@@ -2499,7 +2597,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_break_held = 0;
             if (!g_paused) update_camera(dt, (float)td);
             update_gamepad(dt);
-            if (!g_paused && !g_dead) {
+            if (!g_paused && !g_dead && !g_craft_open) {
                 if (dt > 0.1f) dt = 0.1f;
                 if (GetFocus() == g_hwnd &&
                     (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
