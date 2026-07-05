@@ -101,7 +101,8 @@ running on our engine)
       FLY = creative (instant break, infinite blocks). Save v3 carries the inventory.
 - [x] E2. Break-times by hardness (hold to dig), crack overlay, particle burst
 - [x] E3. First recipe: C / TRIANGLE = 1 log → 4 planks
-- [ ] E4. Health, fall damage, drowning; respawn
+- [x] E4. Health, fall damage, drowning, death/respawn (hearts + bubbles HUD, red
+      flash, hurt sound; creative invulnerable; inventory kept on death)
 - [ ] E5. Tools (wooden/stone pickaxe+axe+shovel: dig-speed multipliers, real
       MC hardness values return), full crafting menu
 - [ ] E6. Night danger (simple hostile mob) + a couple of day animals
