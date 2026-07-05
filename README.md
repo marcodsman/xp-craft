@@ -103,8 +103,9 @@ running on our engine)
 - [x] E3. First recipe: C / TRIANGLE = 1 log → 4 planks
 - [x] E4. Health, fall damage, drowning, death/respawn (hearts + bubbles HUD, red
       flash, hurt sound; creative invulnerable; inventory kept on death)
-- [ ] E5. Tools (wooden/stone pickaxe+axe+shovel: dig-speed multipliers, real
-      MC hardness values return), full crafting menu
+- [x] E5. Tools (wood/stone pickaxe/axe/shovel; AUTO-APPLY to block class — no
+      hotbar juggling on a pad) + crafting menu (C/TRIANGLE, 8 MC recipes, pad nav).
+      Real MC hardness restored: stone 7.5s by hand, 1.1s wood pick, 0.56s stone pick.
 - [ ] E6. Night danger (simple hostile mob) + a couple of day animals
 
 **Phase D — dreams**
