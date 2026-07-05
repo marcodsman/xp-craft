@@ -47,11 +47,15 @@
 #define AUTOSAVE_S  180.0f
 
 enum { B_AIR, B_GRASS, B_DIRT, B_STONE, B_PLANKS, B_LOG, B_LEAVES,
-       B_SAND, B_WATER, B_COBBLE, B_COAL, B_TORCH, NBLOCKS };
+       B_SAND, B_WATER, B_COBBLE, B_COAL, B_TORCH, B_IRON, B_FURNACE,
+       B_GLASS, NBLOCKS };
 /* non-block inventory items (tools auto-apply to their block class) */
 enum { I_STICK = NBLOCKS, I_WPICK, I_WAXE, I_WSHOVEL,
        I_SPICK, I_SAXE, I_SSHOVEL,
-       I_WSWORD, I_SSWORD, I_PORK, NITEMS };
+       I_WSWORD, I_SSWORD, I_PORK,
+       I_INGOT, I_IPICK, I_IAXE, I_ISHOVEL, I_ISWORD, I_COOKED, NITEMS };
+#define NBLOCKS_V7 12              /* block count at save v7 */
+#define NITEMS_V7 (NBLOCKS_V7 + 10)
 #define NBLOCKS_V6 11              /* block count when save v5/v6 was written */
 #define NITEMS_V5 (NBLOCKS_V6 + 7) /* item count when save v5 was written */
 #define NITEMS_V6 (NBLOCKS_V6 + 10)
@@ -59,14 +63,16 @@ enum { CL_NONE, CL_SHOVEL, CL_PICK, CL_AXE };   /* tool class per block */
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
 enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE, T_PLANKS, T_LOG_SIDE,
        T_LOG_TOP, T_LEAVES, T_SAND, T_WATER, T_COBBLE, T_COAL, T_TORCH,
-       NTILES };
+       T_IRON, T_FURN_S, T_FURN_F, T_GLASS, NTILES };
 
 /* light passes through these; torches emit 14, open sky is 15 */
-#define IS_TRANSPARENT(b) ((b) == B_AIR || (b) == B_WATER || (b) == B_TORCH)
+#define IS_TRANSPARENT(b) \
+    ((b) == B_AIR || (b) == B_WATER || (b) == B_TORCH || (b) == B_GLASS)
 
 static const char *BLOCK_NAME[NBLOCKS] = {
     "air", "grass", "dirt", "stone", "planks", "log", "leaves",
-    "sand", "water", "cobble", "coal", "torch",
+    "sand", "water", "cobble", "coal", "torch", "iron ore", "furnace",
+    "glass",
 };
 
 /* survival design data, lifted from the Minecraft/MineClone2 tables.
@@ -76,23 +82,27 @@ static const float HARD_BASE[NBLOCKS] = {
     [B_GRASS] = 0.6f, [B_DIRT] = 0.5f, [B_STONE] = 1.5f,
     [B_PLANKS] = 2.0f, [B_LOG] = 2.0f, [B_LEAVES] = 0.2f,
     [B_SAND] = 0.5f, [B_COBBLE] = 2.0f, [B_COAL] = 3.0f,
-    [B_TORCH] = 0.1f,
+    [B_TORCH] = 0.1f, [B_IRON] = 3.0f, [B_FURNACE] = 3.5f,
+    [B_GLASS] = 0.3f,
 };
 static const BYTE BLOCK_CLASS[NBLOCKS] = {
     [B_GRASS] = CL_SHOVEL, [B_DIRT] = CL_SHOVEL, [B_SAND] = CL_SHOVEL,
     [B_STONE] = CL_PICK, [B_COBBLE] = CL_PICK, [B_COAL] = CL_PICK,
+    [B_IRON] = CL_PICK, [B_FURNACE] = CL_PICK,
     [B_PLANKS] = CL_AXE, [B_LOG] = CL_AXE,
 };
 static const BYTE DROPS[NBLOCKS] = {    /* what breaking yields */
     [B_GRASS] = B_DIRT, [B_DIRT] = B_DIRT, [B_STONE] = B_COBBLE,
     [B_PLANKS] = B_PLANKS, [B_LOG] = B_LOG, [B_LEAVES] = B_LEAVES,
     [B_SAND] = B_SAND, [B_COBBLE] = B_COBBLE, [B_COAL] = B_COAL,
-    [B_TORCH] = B_TORCH,
+    [B_TORCH] = B_TORCH, [B_IRON] = B_IRON, [B_FURNACE] = B_FURNACE,
+    [B_GLASS] = B_AIR,                  /* glass shatters, MC-style */
 };
 
 /* hotbar */
 static const BYTE HOTBAR[] = { B_GRASS, B_DIRT, B_STONE, B_PLANKS,
-                               B_LOG, B_LEAVES, B_SAND, B_COBBLE, B_TORCH };
+                               B_LOG, B_LEAVES, B_SAND, B_COBBLE, B_TORCH,
+                               B_FURNACE, B_GLASS };
 #define NHOTBAR ((int)sizeof HOTBAR)
 
 typedef struct { float x, y, z; DWORD color; float u, v; } VTX;
@@ -171,6 +181,9 @@ static float g_bob;                 /* walk-bob phase */
 /* health & hazards (survival only; MC numbers: 20 half-hearts,
  * fall damage = blocks - 3, ~15s of air then drowning) */
 static int   g_health = 20;
+static float g_food = 20.0f;        /* hunger: gates regen, 0 = starving */
+static float g_starve_t;
+static int   g_near_furnace;
 static float g_air = 10.0f;
 static int   g_dead;
 static float g_fall_from = -1;      /* y where the current fall began */
@@ -603,6 +616,10 @@ static void gen_world(void)
                 else {
                     b = B_STONE;
                     if (grid3(x, y, z) > 0.972f) b = B_COAL;   /* veins */
+                    if (y < 20 &&
+                        grid3(x * 1.31f + 7, y * 1.17f, z * 1.29f + 3)
+                            > 0.976f)
+                        b = B_IRON;
                     else if (grid3(x + 917, y, z + 313) > 0.985f) b = B_COBBLE;
                 }
                 g_world[y][z][x] = b;
@@ -682,6 +699,10 @@ static const BYTE TILE_FOR[NBLOCKS][6] = {
                    T_COBBLE },
     [B_COAL]   = { T_COAL, T_COAL, T_COAL, T_COAL, T_COAL, T_COAL },
     [B_TORCH]  = { T_TORCH, T_TORCH, T_TORCH, T_TORCH, T_TORCH, T_TORCH },
+    [B_IRON]   = { T_IRON, T_IRON, T_IRON, T_IRON, T_IRON, T_IRON },
+    [B_FURNACE] = { T_FURN_S, T_FURN_S, T_FURN_F, T_FURN_F,
+                    T_FURN_F, T_FURN_F },
+    [B_GLASS]  = { T_GLASS, T_GLASS, T_GLASS, T_GLASS, T_GLASS, T_GLASS },
 };
 
 typedef struct { BYTE tile, face, light, torch;
@@ -759,7 +780,9 @@ static void quad_uv_extent(const QUAD *q, int *w, int *h)
 static int face_visible(int blk, int nb)
 {
     if (blk == B_WATER) return nb == B_AIR || nb == B_TORCH;
-    return !solid_block(nb);        /* solids show against air AND water */
+    if (blk == B_GLASS) return nb != B_GLASS && !solid_block(nb);
+    /* solids show against air, water, AND glass (you see through it) */
+    return !solid_block(nb) || nb == B_GLASS;
 }
 
 /* mask key for a visible face: tile + light of the cell it opens into.
@@ -885,6 +908,7 @@ static void worker_build(int cx, int cz)
             int sg = (q->torch & 2) ? s * 225 / 255 : s;
             int sb = (q->torch & 2) ? s * 170 / 255 : s;
             DWORD col = (t == T_WATER) ? D3DCOLOR_ARGB(160, s, sg, sb)
+                      : (t == T_GLASS) ? D3DCOLOR_ARGB(110, s, sg, sb)
                                        : D3DCOLOR_ARGB(255, s, sg, sb);
             int uw, vh;
             quad_uv_extent(q, &uw, &vh);
@@ -1281,6 +1305,7 @@ static void respawn(void)
 {
     g_dead = 0;
     g_health = 20;
+    g_food = 20.0f;
     g_air = 10.0f;
     g_vel_y = 0;
     g_fall_from = -1;
@@ -1396,22 +1421,43 @@ static void edit_place(void)
     swing_kick();
 }
 
+static int furnace_near(void)
+{
+    int px = (int)floorf(g_cam_x), py = (int)floorf(g_cam_y - 1),
+        pz = (int)floorf(g_cam_z);
+    for (int y = py - 3; y <= py + 3; y++)
+        for (int z = pz - 3; z <= pz + 3; z++)
+            for (int x = px - 3; x <= px + 3; x++)
+                if (block_at(x, y, z) == B_FURNACE)
+                    return 1;
+    return 0;
+}
+
 /* crafting: shapeless-ified MC recipes */
-typedef struct { const char *name, *cost; int out, outn, in1, n1, in2, n2; }
-    RECIPE;
+typedef struct { const char *name, *cost;
+                 int out, outn, in1, n1, in2, n2, furnace; } RECIPE;
 static const RECIPE RECIPES[] = {
-    { "4 planks",      "1 log",              B_PLANKS,  4, B_LOG,    1, -1, 0 },
-    { "4 sticks",      "2 planks",           I_STICK,   4, B_PLANKS, 2, -1, 0 },
-    { "4 torches",     "1 stick + 1 coal",   B_TORCH,   4, I_STICK,  1, B_COAL, 1 },
-    { "wood pickaxe",  "3 planks + 2 sticks", I_WPICK,  1, B_PLANKS, 3, I_STICK, 2 },
-    { "wood axe",      "3 planks + 2 sticks", I_WAXE,   1, B_PLANKS, 3, I_STICK, 2 },
-    { "wood shovel",   "1 plank + 2 sticks",  I_WSHOVEL, 1, B_PLANKS, 1, I_STICK, 2 },
-    { "stone pickaxe", "3 cobble + 2 sticks", I_SPICK,  1, B_COBBLE, 3, I_STICK, 2 },
-    { "stone axe",     "3 cobble + 2 sticks", I_SAXE,   1, B_COBBLE, 3, I_STICK, 2 },
-    { "stone shovel",  "1 cobble + 2 sticks", I_SSHOVEL, 1, B_COBBLE, 1, I_STICK, 2 },
-    { "wood sword",    "2 planks + 1 stick",  I_WSWORD, 1, B_PLANKS, 2, I_STICK, 1 },
-    { "stone sword",   "2 cobble + 1 stick",  I_SSWORD, 1, B_COBBLE, 2, I_STICK, 1 },
-    { "eat porkchop",  "1 porkchop: +4 hearts", -1,     0, I_PORK,   1, -1, 0 },
+    { "4 planks",      "1 log",              B_PLANKS,  4, B_LOG,    1, -1, 0 , 0 },
+    { "4 sticks",      "2 planks",           I_STICK,   4, B_PLANKS, 2, -1, 0 , 0 },
+    { "4 torches",     "1 stick + 1 coal",   B_TORCH,   4, I_STICK,  1, B_COAL, 1 , 0 },
+    { "wood pickaxe",  "3 planks + 2 sticks", I_WPICK,  1, B_PLANKS, 3, I_STICK, 2 , 0 },
+    { "wood axe",      "3 planks + 2 sticks", I_WAXE,   1, B_PLANKS, 3, I_STICK, 2 , 0 },
+    { "wood shovel",   "1 plank + 2 sticks",  I_WSHOVEL, 1, B_PLANKS, 1, I_STICK, 2 , 0 },
+    { "stone pickaxe", "3 cobble + 2 sticks", I_SPICK,  1, B_COBBLE, 3, I_STICK, 2 , 0 },
+    { "stone axe",     "3 cobble + 2 sticks", I_SAXE,   1, B_COBBLE, 3, I_STICK, 2 , 0 },
+    { "stone shovel",  "1 cobble + 2 sticks", I_SSHOVEL, 1, B_COBBLE, 1, I_STICK, 2 , 0 },
+    { "wood sword",    "2 planks + 1 stick",  I_WSWORD, 1, B_PLANKS, 2, I_STICK, 1 , 0 },
+    { "stone sword",   "2 cobble + 1 stick",  I_SSWORD, 1, B_COBBLE, 2, I_STICK, 1 , 0 },
+    { "furnace",       "8 cobble",           B_FURNACE, 1, B_COBBLE, 8, -1, 0 , 0 },
+    { "iron pickaxe",  "3 ingots + 2 sticks", I_IPICK,  1, I_INGOT,  3, I_STICK, 2 , 0 },
+    { "iron axe",      "3 ingots + 2 sticks", I_IAXE,   1, I_INGOT,  3, I_STICK, 2 , 0 },
+    { "iron shovel",   "1 ingot + 2 sticks",  I_ISHOVEL, 1, I_INGOT, 1, I_STICK, 2 , 0 },
+    { "iron sword",    "2 ingots + 1 stick",  I_ISWORD, 1, I_INGOT,  2, I_STICK, 1 , 0 },
+    { "4 iron ingots", "4 ore + 1 coal",      I_INGOT,  4, B_IRON,   4, B_COAL, 1, 1 },
+    { "4 glass",       "4 sand + 1 coal",     B_GLASS,  4, B_SAND,   4, B_COAL, 1, 1 },
+    { "4 cooked pork", "4 pork + 1 coal",     I_COOKED, 4, I_PORK,   4, B_COAL, 1, 1 },
+    { "eat porkchop",  "+5 food",             -1,       5, I_PORK,   1, -1, 0 , 0 },
+    { "eat cooked pork", "+10 food",          -1,      10, I_COOKED, 1, -1, 0 , 0 },
 };
 #define NRECIPES ((int)(sizeof RECIPES / sizeof RECIPES[0]))
 
@@ -1423,6 +1469,11 @@ static int can_craft(const RECIPE *r)
 
 static void do_craft(const RECIPE *r)
 {
+    if (r->furnace && !g_near_furnace) {
+        strcpy(g_toast, "NEEDS A FURNACE NEARBY");
+        g_toast_t = 1.2f;
+        return;
+    }
     if (!can_craft(r)) {
         strcpy(g_toast, "MISSING INGREDIENTS");
         g_toast_t = 1.2f;
@@ -1430,10 +1481,10 @@ static void do_craft(const RECIPE *r)
     }
     g_inv[r->in1] -= r->n1;
     if (r->in2 >= 0) g_inv[r->in2] -= r->n2;
-    if (r->out < 0) {                   /* food: heal instead of yield */
-        g_health += 8;
-        if (g_health > 20) g_health = 20;
-        strcpy(g_toast, "ATE A PORKCHOP (+4 HEARTS)");
+    if (r->out < 0) {                   /* food fills the hunger bar */
+        g_food += r->outn;
+        if (g_food > 20) g_food = 20;
+        sprintf(g_toast, "ATE (%s)", r->cost);
     } else {
         g_inv[r->out] += r->outn;
         sprintf(g_toast, "CRAFTED %s", r->name);
@@ -1542,6 +1593,8 @@ static void step_player(float dt)
     if (g_jump && g_on_ground && !g_in_water) {
         g_vel_y = JUMP_V;
         g_on_ground = 0;
+        g_food -= 0.06f;                /* hunger: jumping */
+        if (g_food < 0) g_food = 0;
         play_sound(3);
     }
 
@@ -1584,10 +1637,19 @@ static void update_survival(float dt)
         if (g_air > 10) g_air = 10;
         g_drown_t = 0;
     }
-    if (g_health < 20) {                    /* peaceful-style regen */
+    if (g_food <= 0) {                      /* starving: down to 1 heart */
+        g_starve_t += dt;
+        if (g_starve_t >= 4.0f) {
+            g_starve_t = 0;
+            if (g_health > 2) damage(1);
+        }
+    } else
+        g_starve_t = 0;
+    if (g_health < 20 && g_food >= 18.0f) { /* well-fed regen costs food */
         g_regen_t += dt;
         if (g_regen_t >= 4.0f) {
             g_regen_t = 0;
+            g_food -= 0.5f;
             g_health++;
         }
     }
@@ -1828,11 +1890,11 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x37435058 /* "XPC7" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x38435058 /* "XPC8" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
-    float ext[5] = { g_spawn_x, g_spawn_y, g_spawn_z,
-                     (float)g_health, g_air };
+    float ext[6] = { g_spawn_x, g_spawn_y, g_spawn_z,
+                     (float)g_health, g_air, g_food };
     fwrite(hdr, sizeof hdr, 1, fp);
     fwrite(st, sizeof st, 1, fp);
     fwrite(ext, sizeof ext, 1, fp);
@@ -1850,7 +1912,7 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        hdr[0] < 0x32435058 || hdr[0] > 0x37435058 ||
+        hdr[0] < 0x32435058 || hdr[0] > 0x38435058 ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1859,27 +1921,30 @@ static int load_world(void)
     memset(g_inv, 0, sizeof g_inv);
     g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
     if (hdr[0] >= 0x34435058) {         /* v4+: spawn + vitals */
-        float ext[5];
-        int ninv = hdr[0] >= 0x37435058 ? NITEMS
-                 : hdr[0] == 0x36435058 ? NITEMS_V6
-                 : hdr[0] == 0x35435058 ? NITEMS_V5 : NBLOCKS_V6;
+        float ext[6] = { 0, 0, 0, 20, 10, 20 };
+        int next = hdr[0] >= 0x38435058 ? 6 : 5;
+        int ninv, oldnb;                /* inventory size + block count then */
+        if      (hdr[0] >= 0x38435058) { ninv = NITEMS;    oldnb = NBLOCKS; }
+        else if (hdr[0] == 0x37435058) { ninv = NITEMS_V7; oldnb = NBLOCKS_V7; }
+        else if (hdr[0] == 0x36435058) { ninv = NITEMS_V6; oldnb = NBLOCKS_V6; }
+        else if (hdr[0] == 0x35435058) { ninv = NITEMS_V5; oldnb = NBLOCKS_V6; }
+        else                           { ninv = NBLOCKS_V6; oldnb = NBLOCKS_V6; }
         int tmp[64] = {0};
-        if (fread(ext, sizeof ext, 1, fp) != 1 ||
+        if (fread(ext, sizeof(float) * next, 1, fp) != 1 ||
             fread(tmp, sizeof(int) * ninv, 1, fp) != 1) {
             fclose(fp);
             return 0;
         }
-        if (hdr[0] >= 0x37435058) {
-            memcpy(g_inv, tmp, sizeof(int) * NITEMS);
-        } else {                        /* B_TORCH inserted at 11: old item
-                                           ids >= 11 shift up by one */
-            for (int i = 0; i < ninv && i < 64; i++)
-                g_inv[i < NBLOCKS_V6 ? i : i + 1] = tmp[i];
-        }
+        /* new blocks are inserted before the items: block ids are stable,
+         * item ids shift up by however many blocks were added since */
+        for (int i = 0; i < ninv && i < 64; i++)
+            g_inv[i < oldnb ? i : i + (NBLOCKS - oldnb)] = tmp[i];
         g_spawn_x = ext[0]; g_spawn_y = ext[1]; g_spawn_z = ext[2];
         g_health = (int)ext[3];
         g_air = ext[4];
+        g_food = ext[5];
         if (g_health <= 0 || g_health > 20) g_health = 20;
+        if (g_food < 0 || g_food > 20) g_food = 20;
     } else if (hdr[0] == 0x33435058) {  /* v3: block inventory only */
         if (fread(g_inv, sizeof(int) * NBLOCKS_V6, 1, fp) != 1) {
             fclose(fp);
@@ -2062,6 +2127,36 @@ static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
         *r = *g = *b = 110 + n - 17;
         if (((x / 6) * 31 + (y / 6) * 17) % 7 < 2 &&
             (rng() & 3)) { *r = *g = *b = 28 + (int)(rng() % 18); }
+        break;
+    case T_IRON:                        /* stone with rusty flecks */
+        n = (int)(rng() % 35);
+        *r = *g = *b = 110 + n - 17;
+        if (((x / 5) * 29 + (y / 5) * 23) % 8 < 2 && (rng() & 3)) {
+            *r = 205 + (int)(rng() % 30) - 15;
+            *g = 145 + (int)(rng() % 20) - 10;
+            *b = 95;
+        }
+        break;
+    case T_FURN_S:                      /* dark dressed stone */
+        n = (int)(rng() % 22);
+        *r = *g = *b = 88 + n - 11;
+        if (x % 16 < 2 || y % 16 < 2) { *r -= 28; *g -= 28; *b -= 28; }
+        break;
+    case T_FURN_F: {                    /* front: glowing mouth */
+        n = (int)(rng() % 22);
+        *r = *g = *b = 88 + n - 11;
+        if (x % 16 < 2 || y % 16 < 2) { *r -= 28; *g -= 28; *b -= 28; }
+        if (x >= 20 && x < 44 && y >= 34 && y < 54) {
+            int fn = (int)(rng() % 60);
+            *r = 235; *g = 120 + fn; *b = 30;
+        }
+        break;
+    }
+    case T_GLASS:                       /* pale pane with a strong frame */
+        *r = *g = *b = 225 + (int)(rng() % 20);
+        if (x < 3 || y < 3 || x > 60 || y > 60) {
+            *r = 168; *g = 180; *b = 190;
+        }
         break;
     case T_TORCH:                       /* glowing tip over a wood shaft */
         n = (int)(rng() % 30);
@@ -2374,6 +2469,19 @@ static void draw_health(void)
                      D3DCOLOR_ARGB(235, 210, 30, 30), NULL, 0, 0, 0, 0);
     }
 
+    for (int i = 0; i < 10; i++) {      /* hunger: 2 food each, right side */
+        float x = x0 + total - 170 + i * 17;
+        int fd = (int)g_food - i * 2;
+        hud_quad(x, y, x + 14, y + 14, D3DCOLOR_ARGB(190, 30, 20, 6),
+                 NULL, 0, 0, 0, 0);
+        if (fd >= 2)
+            hud_quad(x + 2, y + 2, x + 12, y + 12,
+                     D3DCOLOR_ARGB(235, 205, 130, 30), NULL, 0, 0, 0, 0);
+        else if (fd == 1)
+            hud_quad(x + 2, y + 2, x + 7, y + 12,
+                     D3DCOLOR_ARGB(235, 205, 130, 30), NULL, 0, 0, 0, 0);
+    }
+
     if (g_air < 10.0f) {                /* bubbles while submerged */
         float by = y - 20;
         int full = (int)ceilf(g_air);
@@ -2400,7 +2508,7 @@ static void draw_craft(void)
     float y = y0 + 46;
     for (int i = 0; i < NRECIPES; i++) {
         const RECIPE *r = &RECIPES[i];
-        int ok = can_craft(r);
+        int ok = can_craft(r) && (!r->furnace || g_near_furnace);
         char line[96];
         int have = g_inv[r->out];
         sprintf(line, "%s%-14s %-21s%s", i == g_craft_sel ? "> " : "  ",
@@ -2617,7 +2725,10 @@ static void update_gamepad_mapped(float dt)
     }
 
     static unsigned prev_tri;
-    if (p.triangle && !prev_tri) { g_craft_open = 1; g_craft_sel = 0; }
+    if (p.triangle && !prev_tri) {
+        g_craft_open = 1; g_craft_sel = 0;
+        g_near_furnace = furnace_near();
+    }
     prev_tri = p.triangle;
 
     if (p.square && !prev_sq) hotbar_step(1);
@@ -2689,7 +2800,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_sel = HOTBAR[g_hotbar_idx];
         }
         else if (w == 'F') { g_walk = !g_walk; g_vel_y = 0; }
-        else if (w == 'C') { g_craft_open = 1; g_craft_sel = 0; }
+        else if (w == 'C') {
+            g_craft_open = 1; g_craft_sel = 0;
+            g_near_furnace = furnace_near();
+        }
         else if (w == VK_F3) g_stats = !g_stats;
         else if (w == VK_F5) save_world();
         return 0;
@@ -2874,8 +2988,9 @@ static void draw_mobs(void)
 static IDirect3DTexture9 *item_tex(int item)
 {
     if (item < NBLOCKS) return g_tex[TILE_FOR[item][F_NORTH]];
-    if (item == I_PORK) return g_mobtex[0];
+    if (item == I_PORK || item == I_COOKED) return g_mobtex[0];
     if (item == I_STICK) return g_tex[T_LOG_SIDE];
+    if (item == I_INGOT) return g_tex[T_IRON];
     return g_tex[T_PLANKS];
 }
 
@@ -2975,17 +3090,22 @@ static void render_frame(void)
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_DESTBLEND,
                                         D3DBLEND_INVSRCALPHA);
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, FALSE);
-        IDirect3DDevice9_SetTexture(g_dev, 0,
-                                    (IDirect3DBaseTexture9 *)g_tex[T_WATER]);
-        for (int i = 0; i < nvis; i++) {
-            CHUNKMESH *c = vis[i];
-            if (!c->prims[T_WATER]) continue;
-            IDirect3DDevice9_SetStreamSource(g_dev, 0, c->vb, 0, sizeof(VTX));
-            IDirect3DDevice9_SetIndices(g_dev, c->ib);
-            IDirect3DDevice9_DrawIndexedPrimitive(g_dev, D3DPT_TRIANGLELIST,
-                    0, 0, c->nverts, c->ib_start[T_WATER],
-                    c->prims[T_WATER]);
-            g_drawn_tris += c->prims[T_WATER];
+        static const int TRANS[2] = { T_WATER, T_GLASS };
+        for (int ti = 0; ti < 2; ti++) {
+            int tt = TRANS[ti];
+            IDirect3DDevice9_SetTexture(g_dev, 0,
+                                        (IDirect3DBaseTexture9 *)g_tex[tt]);
+            for (int i = 0; i < nvis; i++) {
+                CHUNKMESH *c = vis[i];
+                if (!c->prims[tt]) continue;
+                IDirect3DDevice9_SetStreamSource(g_dev, 0, c->vb, 0,
+                                                 sizeof(VTX));
+                IDirect3DDevice9_SetIndices(g_dev, c->ib);
+                IDirect3DDevice9_DrawIndexedPrimitive(g_dev,
+                        D3DPT_TRIANGLELIST, 0, 0, c->nverts,
+                        c->ib_start[tt], c->prims[tt]);
+                g_drawn_tris += c->prims[tt];
+            }
         }
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZWRITEENABLE, TRUE);
         IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE, FALSE);
