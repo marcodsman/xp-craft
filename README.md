@@ -94,6 +94,18 @@ triangles — leaves defeat greedy meshing by design (ragged corners).
 **Dev args:** `windowed`, `bench`, `time=0..1` (freeze time of day), `volume=0..100`,
 `at=x,z` (teleport, flying).
 
+**Phase E — the survival loop** (design copied from Minecraft/MineClone2 data,
+running on our engine)
+- [x] E1. Drops + inventory: breaking yields (stone→cobble, grass→dirt, rest drop
+      themselves), placing costs; hotbar counts, gray empty slots. WALK = survival,
+      FLY = creative (instant break, infinite blocks). Save v3 carries the inventory.
+- [x] E2. Break-times by hardness (hold to dig), crack overlay, particle burst
+- [x] E3. First recipe: C / TRIANGLE = 1 log → 4 planks
+- [ ] E4. Health, fall damage, drowning; respawn
+- [ ] E5. Tools (wooden/stone pickaxe+axe+shovel: dig-speed multipliers, real
+      MC hardness values return), full crafting menu
+- [ ] E6. Night danger (simple hostile mob) + a couple of day animals
+
 **Phase D — dreams**
 - [ ] D1. LAN multiplayer (the laptop joins the den as player 2)
 - [ ] D2. Simple mobs (wandering animals; the Atom sets the population cap)
