@@ -106,7 +106,9 @@ running on our engine)
 - [x] E5. Tools (wood/stone pickaxe/axe/shovel; AUTO-APPLY to block class — no
       hotbar juggling on a pad) + crafting menu (C/TRIANGLE, 8 MC recipes, pad nav).
       Real MC hardness restored: stone 7.5s by hand, 1.1s wood pick, 0.56s stone pick.
-- [ ] E6. Night danger (simple hostile mob) + a couple of day animals
+- [x] E6. Mobs: pigs by day (drop porkchops -> +4 hearts via the menu), zombies at
+      night (chase, melee, burn at dawn), swords (wood 4 / stone 5 dmg, auto-apply),
+      knockback, population caps sized for the Atom. Nothing survives the save file.
 
 **Phase D — dreams**
 - [ ] D1. LAN multiplayer (the laptop joins the den as player 2)
