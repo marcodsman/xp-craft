@@ -146,6 +146,16 @@ static float g_swing;               /* 0..1 animation phase */
 static int   g_swing_on;
 static float g_bob;                 /* walk-bob phase */
 
+/* health & hazards (survival only; MC numbers: 20 half-hearts,
+ * fall damage = blocks - 3, ~15s of air then drowning) */
+static int   g_health = 20;
+static float g_air = 10.0f;
+static int   g_dead;
+static float g_fall_from = -1;      /* y where the current fall began */
+static float g_hurt_t;              /* red flash timer */
+static float g_regen_t, g_drown_t;
+static float g_spawn_x, g_spawn_y, g_spawn_z;
+
 /* particles */
 #define NPART 96
 static struct {
@@ -883,6 +893,32 @@ static void swing_kick(void)
     }
 }
 
+static void damage(int hp)
+{
+    if (!g_walk || g_dead) return;      /* creative is invulnerable */
+    g_health -= hp;
+    g_hurt_t = 0.35f;
+    g_regen_t = 0;
+    play_sound(4);
+    if (g_health <= 0) {
+        g_health = 0;
+        g_dead = 1;
+        g_break_on = 0;
+    }
+}
+
+static void respawn(void)
+{
+    g_dead = 0;
+    g_health = 20;
+    g_air = 10.0f;
+    g_vel_y = 0;
+    g_fall_from = -1;
+    g_cam_x = g_spawn_x;
+    g_cam_y = g_spawn_y;
+    g_cam_z = g_spawn_z;
+}
+
 static void break_complete(int x, int y, int z)
 {
     int blk = block_at(x, y, z);
@@ -1022,6 +1058,7 @@ static void step_player(float dt)
         g_cam_z += (fz * f + rz * s) * sp;
         g_cam_y += g_move_u * sp;
         g_vel_y = 0;
+        g_fall_from = -1;
         return;
     }
 
@@ -1039,15 +1076,25 @@ static void step_player(float dt)
         g_vel_y -= 7.0f * dt;
         if (g_jump) g_vel_y = 2.8f;         /* paddle up */
         if (g_vel_y < -3.0f) g_vel_y = -3.0f;
+        g_fall_from = -1;                   /* water breaks falls */
     } else {
         g_vel_y -= GRAVITY * dt;
         if (g_vel_y < -50) g_vel_y = -50;
+        if (g_vel_y < 0 && g_fall_from < 0)
+            g_fall_from = g_cam_y;          /* top of this fall */
     }
 
     int was_falling = g_vel_y < 0;
     g_on_ground = 0;
     if (move_axis(g_vel_y * dt, 1)) {
-        if (was_falling) g_on_ground = 1;
+        if (was_falling) {
+            g_on_ground = 1;
+            if (g_fall_from >= 0) {         /* MC: blocks fallen - 3 */
+                int dmg = (int)((g_fall_from - g_cam_y) - 3.0f);
+                if (dmg > 0) damage(dmg);
+                g_fall_from = -1;
+            }
+        }
         g_vel_y = 0;
     }
     if (g_jump && g_on_ground && !g_in_water) {
@@ -1068,6 +1115,39 @@ static void step_player(float dt)
     }
 }
 
+/* drowning + slow regen, per frame (survival only) */
+static void update_survival(float dt)
+{
+    if (!g_walk || g_dead) {
+        g_air = 10.0f;
+        return;
+    }
+    int head_in = block_at((int)floorf(g_cam_x), (int)floorf(g_cam_y),
+                           (int)floorf(g_cam_z)) == B_WATER;
+    if (head_in) {
+        g_air -= dt * (10.0f / 15.0f);      /* ~15s of breath */
+        if (g_air <= 0) {
+            g_air = 0;
+            g_drown_t += dt;
+            if (g_drown_t >= 1.0f) {
+                g_drown_t = 0;
+                damage(2);
+            }
+        }
+    } else {
+        g_air += dt * 4.0f;
+        if (g_air > 10) g_air = 10;
+        g_drown_t = 0;
+    }
+    if (g_health < 20) {                    /* peaceful-style regen */
+        g_regen_t += dt;
+        if (g_regen_t >= 4.0f) {
+            g_regen_t = 0;
+            g_health++;
+        }
+    }
+}
+
 /* --------------------------------------------------------- save / load --- */
 
 static void world_file_path(void)
@@ -1082,11 +1162,14 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x33435058 /* "XPC3" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x34435058 /* "XPC4" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
+    float ext[5] = { g_spawn_x, g_spawn_y, g_spawn_z,
+                     (float)g_health, g_air };
     fwrite(hdr, sizeof hdr, 1, fp);
     fwrite(st, sizeof st, 1, fp);
+    fwrite(ext, sizeof ext, 1, fp);
     fwrite(g_inv, sizeof g_inv, 1, fp);
     fwrite(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
     fclose(fp);
@@ -1101,19 +1184,32 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        (hdr[0] != 0x33435058 && hdr[0] != 0x32435058 /* v2 ok */) ||
+        (hdr[0] != 0x34435058 && hdr[0] != 0x33435058 &&
+         hdr[0] != 0x32435058) ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
         return 0;
     }
-    if (hdr[0] == 0x33435058) {         /* v3 carries the inventory */
+    memset(g_inv, 0, sizeof g_inv);
+    g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
+    if (hdr[0] == 0x34435058) {         /* v4: spawn + vitals */
+        float ext[5];
+        if (fread(ext, sizeof ext, 1, fp) != 1 ||
+            fread(g_inv, sizeof g_inv, 1, fp) != 1) {
+            fclose(fp);
+            return 0;
+        }
+        g_spawn_x = ext[0]; g_spawn_y = ext[1]; g_spawn_z = ext[2];
+        g_health = (int)ext[3];
+        g_air = ext[4];
+        if (g_health <= 0 || g_health > 20) g_health = 20;
+    } else if (hdr[0] == 0x33435058) {  /* v3: inventory only */
         if (fread(g_inv, sizeof g_inv, 1, fp) != 1) {
             fclose(fp);
             return 0;
         }
-    } else
-        memset(g_inv, 0, sizeof g_inv);
+    }
     size_t ok = fread(g_world, (size_t)WORLD_H * WZ * WX, 1, fp);
     fclose(fp);
     if (ok != 1) return 0;
@@ -1133,16 +1229,18 @@ static int load_world(void)
  * 22 kHz effects: 0=dig 1=place 2=step 3=jump. volume=0 disables. */
 
 #define SND_HZ 22050
-static struct { short *pcm; int len; } g_snd[4];
+#define NSOUNDS 5                   /* dig place step jump hurt */
+static struct { short *pcm; int len; } g_snd[NSOUNDS];
 static struct { HWAVEOUT h; WAVEHDR hdr; int busy; } g_voice[4];
 static int g_volume = 35;
 
 static void gen_sounds(void)
 {
     unsigned rng = 77777;
-    for (int s = 0; s < 4; s++) {
+    for (int s = 0; s < NSOUNDS; s++) {
         int len = s == 0 ? SND_HZ / 11 : s == 1 ? SND_HZ / 28
-                : s == 2 ? SND_HZ / 18 : SND_HZ / 9;
+                : s == 2 ? SND_HZ / 18 : s == 3 ? SND_HZ / 9
+                : SND_HZ / 6;
         short *p = malloc(sizeof(short) * len);
         float lp = 0;
         for (int i = 0; i < len; i++) {
@@ -1164,8 +1262,12 @@ static void gen_sounds(void)
                 lp += (n - lp) * 0.35f;
                 v = lp * 0.55f;
                 break;
-            default:                    /* jump: rising chirp */
+            case 3:                     /* jump: rising chirp */
                 v = sinf(i * 2 * 3.14159f * (300 + 400 * t) / SND_HZ) * 0.4f;
+                break;
+            default:                    /* hurt: falling groan + thump */
+                v = sinf(i * 2 * 3.14159f * (200 - 110 * t) / SND_HZ) * 0.55f
+                  + n * 0.18f * (1 - t);
                 break;
             }
             float out = v * env;
@@ -1533,6 +1635,52 @@ static void draw_hotbar(void)
     draw_text(tx, y - 26, label, D3DCOLOR_ARGB(220, 255, 255, 255));
 }
 
+static void draw_health(void)
+{
+    if (!g_walk) return;                /* creative shows no vitals */
+    float slot = 46, pad = 5;
+    float total = NHOTBAR * slot + (NHOTBAR - 1) * pad;
+    float x0 = (g_win_w - total) / 2.0f;
+    float y = g_win_h - slot - 12 - 46;
+
+    for (int i = 0; i < 10; i++) {      /* hearts: 2 hp each */
+        float x = x0 + i * 17;
+        int hp = g_health - i * 2;
+        hud_quad(x, y, x + 14, y + 14, D3DCOLOR_ARGB(190, 25, 8, 8),
+                 NULL, 0, 0, 0, 0);
+        if (hp >= 2)
+            hud_quad(x + 2, y + 2, x + 12, y + 12,
+                     D3DCOLOR_ARGB(235, 210, 30, 30), NULL, 0, 0, 0, 0);
+        else if (hp == 1)
+            hud_quad(x + 2, y + 2, x + 7, y + 12,
+                     D3DCOLOR_ARGB(235, 210, 30, 30), NULL, 0, 0, 0, 0);
+    }
+
+    if (g_air < 10.0f) {                /* bubbles while submerged */
+        float by = y - 20;
+        int full = (int)ceilf(g_air);
+        for (int i = 0; i < 10; i++) {
+            float x = x0 + i * 17;
+            hud_quad(x + 2, by, x + 12, by + 10,
+                     i < full ? D3DCOLOR_ARGB(220, 90, 160, 255)
+                              : D3DCOLOR_ARGB(120, 20, 30, 50),
+                     NULL, 0, 0, 0, 0);
+        }
+    }
+}
+
+static void draw_death(void)
+{
+    hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
+             D3DCOLOR_ARGB(150, 90, 0, 0), NULL, 0, 0, 0, 0);
+    const char *t1 = "YOU DIED";
+    const char *t2 = "CROSS / ENTER TO RESPAWN";
+    draw_text((g_win_w - (float)strlen(t1) * g_glyph_w) / 2,
+              g_win_h / 2.0f - 40, t1, D3DCOLOR_ARGB(255, 255, 220, 220));
+    draw_text((g_win_w - (float)strlen(t2) * g_glyph_w) / 2,
+              g_win_h / 2.0f + 4, t2, D3DCOLOR_ARGB(220, 230, 200, 200));
+}
+
 static void draw_crosshair(void)
 {
     float cx = g_win_w / 2.0f, cy = g_win_h / 2.0f;
@@ -1646,6 +1794,11 @@ static void update_gamepad_mapped(float dt)
     static unsigned prev_cross, prev_start, prev_sq, prev_up, prev_down,
                     prev_l1, prev_r1;
 
+    if (g_dead) {                       /* death screen: CROSS respawns */
+        if (p.cross && !prev_cross) respawn();
+        prev_cross = p.cross;
+        return;
+    }
     if (g_paused) {                     /* menu navigation */
         if (p.up && !prev_up)     g_menu_sel = (g_menu_sel + 2) % 3;
         if (p.down && !prev_down) g_menu_sel = (g_menu_sel + 1) % 3;
@@ -1744,6 +1897,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     switch (m) {
     case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
     case WM_KEYDOWN:
+        if (g_dead) {
+            if (w == VK_RETURN || w == VK_SPACE) respawn();
+            return 0;
+        }
         if (g_paused) {
             if (w == VK_UP)     g_menu_sel = (g_menu_sel + 2) % 3;
             if (w == VK_DOWN)   g_menu_sel = (g_menu_sel + 1) % 3;
@@ -2109,8 +2266,13 @@ static void render_frame(void)
         /* ------------------------------------------------------- HUD ----- */
         if (!g_bench) {
             hud_begin();
+            if (g_hurt_t > 0)           /* red damage flash */
+                hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
+                         D3DCOLOR_ARGB((int)(g_hurt_t / 0.35f * 110),
+                                       200, 0, 0), NULL, 0, 0, 0, 0);
             draw_crosshair();
             draw_hotbar();
+            draw_health();
             if (g_stats) {
                 extern float g_fps;
                 static char line[160];
@@ -2131,6 +2293,7 @@ static void render_frame(void)
                           D3DCOLOR_ARGB(240, 255, 240, 150));
             }
             if (g_paused) draw_menu();
+            if (g_dead) draw_death();
             hud_end();
         }
 
@@ -2281,6 +2444,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_cam_y = terrain_h(sx, sz) + EYE_H + 2.0f;
         }
         g_pitch = 0.15f;
+        g_spawn_x = g_cam_x;            /* world spawn = first stand */
+        g_spawn_y = g_cam_y;
+        g_spawn_z = g_cam_z;
     }
     if (g_bench) g_walk = 0;
     if (ta) g_tod = arg_tod;        /* time= wins over the saved time */
@@ -2333,7 +2499,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_break_held = 0;
             if (!g_paused) update_camera(dt, (float)td);
             update_gamepad(dt);
-            if (!g_paused) {
+            if (!g_paused && !g_dead) {
                 if (dt > 0.1f) dt = 0.1f;
                 if (GetFocus() == g_hwnd &&
                     (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
@@ -2360,6 +2526,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
                 update_breaking(dt, g_break_held);
                 update_particles(dt);
                 step_player(dt);
+                update_survival(dt);
                 g_autosave_t += dt;
                 if (g_autosave_t > AUTOSAVE_S) {
                     g_autosave_t = 0;
@@ -2371,6 +2538,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         update_daylight(dt);
         if (g_toast_t > 0) g_toast_t -= dt;
         else g_toast[0] = 0;
+        if (g_hurt_t > 0) g_hurt_t -= dt;
 
         stream_chunks();
         render_frame();
