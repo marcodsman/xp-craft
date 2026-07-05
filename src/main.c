@@ -47,20 +47,26 @@
 #define AUTOSAVE_S  180.0f
 
 enum { B_AIR, B_GRASS, B_DIRT, B_STONE, B_PLANKS, B_LOG, B_LEAVES,
-       B_SAND, B_WATER, B_COBBLE, B_COAL, NBLOCKS };
+       B_SAND, B_WATER, B_COBBLE, B_COAL, B_TORCH, NBLOCKS };
 /* non-block inventory items (tools auto-apply to their block class) */
 enum { I_STICK = NBLOCKS, I_WPICK, I_WAXE, I_WSHOVEL,
        I_SPICK, I_SAXE, I_SSHOVEL,
        I_WSWORD, I_SSWORD, I_PORK, NITEMS };
-#define NITEMS_V5 (NBLOCKS + 7)    /* item count when save v5 was written */
+#define NBLOCKS_V6 11              /* block count when save v5/v6 was written */
+#define NITEMS_V5 (NBLOCKS_V6 + 7) /* item count when save v5 was written */
+#define NITEMS_V6 (NBLOCKS_V6 + 10)
 enum { CL_NONE, CL_SHOVEL, CL_PICK, CL_AXE };   /* tool class per block */
 enum { F_TOP, F_BOTTOM, F_NORTH, F_SOUTH, F_WEST, F_EAST };
 enum { T_GRASS_TOP, T_GRASS_SIDE, T_DIRT, T_STONE, T_PLANKS, T_LOG_SIDE,
-       T_LOG_TOP, T_LEAVES, T_SAND, T_WATER, T_COBBLE, T_COAL, NTILES };
+       T_LOG_TOP, T_LEAVES, T_SAND, T_WATER, T_COBBLE, T_COAL, T_TORCH,
+       NTILES };
+
+/* light passes through these; torches emit 14, open sky is 15 */
+#define IS_TRANSPARENT(b) ((b) == B_AIR || (b) == B_WATER || (b) == B_TORCH)
 
 static const char *BLOCK_NAME[NBLOCKS] = {
     "air", "grass", "dirt", "stone", "planks", "log", "leaves",
-    "sand", "water", "cobble", "coal",
+    "sand", "water", "cobble", "coal", "torch",
 };
 
 /* survival design data, lifted from the Minecraft/MineClone2 tables.
@@ -70,6 +76,7 @@ static const float HARD_BASE[NBLOCKS] = {
     [B_GRASS] = 0.6f, [B_DIRT] = 0.5f, [B_STONE] = 1.5f,
     [B_PLANKS] = 2.0f, [B_LOG] = 2.0f, [B_LEAVES] = 0.2f,
     [B_SAND] = 0.5f, [B_COBBLE] = 2.0f, [B_COAL] = 3.0f,
+    [B_TORCH] = 0.1f,
 };
 static const BYTE BLOCK_CLASS[NBLOCKS] = {
     [B_GRASS] = CL_SHOVEL, [B_DIRT] = CL_SHOVEL, [B_SAND] = CL_SHOVEL,
@@ -80,11 +87,12 @@ static const BYTE DROPS[NBLOCKS] = {    /* what breaking yields */
     [B_GRASS] = B_DIRT, [B_DIRT] = B_DIRT, [B_STONE] = B_COBBLE,
     [B_PLANKS] = B_PLANKS, [B_LOG] = B_LOG, [B_LEAVES] = B_LEAVES,
     [B_SAND] = B_SAND, [B_COBBLE] = B_COBBLE, [B_COAL] = B_COAL,
+    [B_TORCH] = B_TORCH,
 };
 
 /* hotbar */
 static const BYTE HOTBAR[] = { B_GRASS, B_DIRT, B_STONE, B_PLANKS,
-                               B_LOG, B_LEAVES, B_SAND, B_COBBLE };
+                               B_LOG, B_LEAVES, B_SAND, B_COBBLE, B_TORCH };
 #define NHOTBAR ((int)sizeof HOTBAR)
 
 typedef struct { float x, y, z; DWORD color; float u, v; } VTX;
@@ -353,13 +361,215 @@ static float fbm2(float x, float z)
 
 /* --------------------------------------------------------------- world ---- */
 
-static int solid_block(int b) { return b != B_AIR && b != B_WATER; }
+static int solid_block(int b)
+{
+    return b != B_AIR && b != B_WATER && b != B_TORCH;
+}
 
 static int block_at(int x, int y, int z)
 {
     if (y < 0) return B_STONE;
     if (x < 0 || z < 0 || x >= WX || z >= WZ || y >= WORLD_H) return B_AIR;
     return g_world[y][z][x];
+}
+
+/* ------------------------------------------------------------ lighting --- */
+/* Two channels per cell: hi nibble = sky, lo = block (torches emit 14).
+ * Light spreads -1 per step (-3 through water); open-sky columns carry 15
+ * straight down. Levels bake into vertex colors at MESH time; sky light is
+ * scaled by the daylight bucket (0..7), and bucket changes mark built
+ * chunks dirty so the async worker re-bakes the world over a few frames.
+ * Edits run the classic two-queue incremental add/remove BFS. */
+
+static BYTE *g_lightmap;            /* same [y][z][x] layout as g_world */
+#define LIDX(x, y, z) ((((size_t)(y) * WZ + (z)) * WX) + (x))
+static volatile LONG g_lbucket = 7; /* daylight quantized 0..7 */
+static BYTE g_bright[16];           /* light level -> vertex brightness */
+
+#define LQCAP (1 << 22)             /* 4M entries per queue (16 MB each) */
+static int *g_lq, *g_lq2;           /* add queue, remove queue */
+static int g_lmin[3], g_lmax[3];    /* bbox touched by the last relight */
+
+#define LPACK(x, y, z) ((x) | ((z) << 9) | ((y) << 18))
+
+static void init_bright(void)
+{
+    /* gentler than MC's 0.8^n: ambient floor keeps caves readable as
+     * shapes, curve keeps torch pools warm and obvious */
+    for (int i = 0; i < 16; i++) {
+        float v = 255.0f * (0.10f + 0.90f * powf(i / 15.0f, 1.6f));
+        g_bright[i] = (BYTE)v;
+    }
+}
+
+static int lget(int ch, int x, int y, int z)
+{
+    if (y >= WORLD_H) return ch ? 0 : 15;
+    if (x < 0 || y < 0 || z < 0 || x >= WX || z >= WZ) return 0;
+    BYTE v = g_lightmap[LIDX(x, y, z)];
+    return ch ? (v & 15) : (v >> 4);
+}
+
+static void lset(int ch, int x, int y, int z, int l)
+{
+    BYTE *p = &g_lightmap[LIDX(x, y, z)];
+    *p = ch ? (BYTE)((*p & 0xF0) | l) : (BYTE)((*p & 0x0F) | (l << 4));
+    if (x < g_lmin[0]) g_lmin[0] = x;
+    if (x > g_lmax[0]) g_lmax[0] = x;
+    if (z < g_lmin[2]) g_lmin[2] = z;
+    if (z > g_lmax[2]) g_lmax[2] = z;
+}
+
+/* final 0..15 level of a cell under the current daylight bucket */
+static int light_level(int x, int y, int z)
+{
+    int s = lget(0, x, y, z) * g_lbucket / 7;
+    int b = lget(1, x, y, z);
+    return s > b ? s : b;
+}
+
+static const int LDIR[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0},
+                                {0,0,1}, {0,0,-1} };
+
+/* spread queued light outward until nothing brightens (channel ch) */
+static void light_add_bfs(int ch, int *q, int head, int tail)
+{
+    while (head != tail) {
+        int p = q[head++ & (LQCAP - 1)];
+        int x = p & 511, z = (p >> 9) & 511, y = p >> 18;
+        int L = lget(ch, x, y, z);
+        if (L <= 1) continue;
+        for (int d = 0; d < 6; d++) {
+            int nx = x + LDIR[d][0], ny = y + LDIR[d][1],
+                nz = z + LDIR[d][2];
+            if (nx < 0 || nz < 0 || ny < 0 ||
+                nx >= WX || nz >= WZ || ny >= WORLD_H) continue;
+            int nb = g_world[ny][nz][nx];
+            if (!IS_TRANSPARENT(nb)) continue;
+            int nl;
+            if (ch == 0 && LDIR[d][1] == -1 && L == 15 && nb != B_WATER)
+                nl = 15;                        /* sunlight falls freely */
+            else
+                nl = L - (nb == B_WATER ? 3 : 1);
+            if (nl <= lget(ch, nx, ny, nz)) continue;
+            lset(ch, nx, ny, nz, nl);
+            if (tail - head < LQCAP - 1)
+                q[tail++ & (LQCAP - 1)] = LPACK(nx, ny, nz);
+        }
+    }
+}
+
+/* incremental relight after g_world[y][z][x] changed old -> new.
+ * Each channel in full sequence: darkness flood, re-seed, spread. */
+static void relight_change(int x, int y, int z, int oldb, int newb)
+{
+    (void)oldb;
+    for (int ch = 0; ch < 2; ch++) {
+        int atail = 0;                      /* add seeds -> g_lq */
+        int dhead = 0, dtail = 0;           /* removal queue (light<<24) */
+        int old_l = lget(ch, x, y, z);
+
+        if (old_l > 0) {                    /* darkness flood from the cell */
+            lset(ch, x, y, z, 0);
+            g_lq2[dtail++ & (LQCAP - 1)] = LPACK(x, y, z) | (old_l << 24);
+        }
+        while (dhead != dtail) {
+            int p = g_lq2[dhead++ & (LQCAP - 1)];
+            int old = p >> 24;
+            int px = p & 511, pz = (p >> 9) & 511, py = (p >> 18) & 63;
+            for (int d = 0; d < 6; d++) {
+                int nx = px + LDIR[d][0], ny = py + LDIR[d][1],
+                    nz = pz + LDIR[d][2];
+                if (nx < 0 || nz < 0 || ny < 0 ||
+                    nx >= WX || nz >= WZ || ny >= WORLD_H) continue;
+                if (!IS_TRANSPARENT(g_world[ny][nz][nx])) continue;
+                int nl = lget(ch, nx, ny, nz);
+                if (nl == 0) continue;
+                if (nl < old ||
+                    (ch == 0 && LDIR[d][1] == -1 && old == 15 && nl == 15)) {
+                    lset(ch, nx, ny, nz, 0);
+                    if (dtail - dhead < LQCAP - 1)
+                        g_lq2[dtail++ & (LQCAP - 1)] =
+                            LPACK(nx, ny, nz) | (nl << 24);
+                } else if (atail < LQCAP - 1)
+                    g_lq[atail++] = LPACK(nx, ny, nz);
+            }
+        }
+
+        if (IS_TRANSPARENT(newb)) {         /* new source / re-opened cell */
+            if (ch == 1 && newb == B_TORCH) {
+                lset(1, x, y, z, 14);
+                g_lq[atail++] = LPACK(x, y, z);
+            }
+            if (ch == 0 && y == WORLD_H - 1) {  /* opened to the sky */
+                lset(0, x, y, z, newb == B_WATER ? 12 : 15);
+                g_lq[atail++] = LPACK(x, y, z);
+            }
+            for (int d = 0; d < 6; d++) {   /* pull light back in */
+                int nx = x + LDIR[d][0], ny = y + LDIR[d][1],
+                    nz = z + LDIR[d][2];
+                if (nx < 0 || nz < 0 || ny < 0 ||
+                    nx >= WX || nz >= WZ || ny >= WORLD_H) continue;
+                if (lget(ch, nx, ny, nz) > 1 && atail < LQCAP - 1)
+                    g_lq[atail++] = LPACK(nx, ny, nz);
+            }
+        }
+        light_add_bfs(ch, g_lq, 0, atail);
+    }
+}
+
+/* full-world relight: at gen and load (light isn't saved — recomputed) */
+static void full_relight(void)
+{
+    memset(g_lightmap, 0, (size_t)WORLD_H * WZ * WX);
+    int tail = 0;
+
+    /* sky columns straight down, attenuating through water */
+    for (int z = 0; z < WZ; z++)
+        for (int x = 0; x < WX; x++) {
+            int L = 15;
+            for (int y = WORLD_H - 1; y >= 0 && L > 0; y--) {
+                int b = g_world[y][z][x];
+                if (!IS_TRANSPARENT(b)) break;
+                if (b == B_WATER) L = L > 3 ? L - 3 : 0;
+                else if (L < 15) L = L - 1;
+                if (L > 0)
+                    g_lightmap[LIDX(x, y, z)] = (BYTE)(L << 4);
+            }
+        }
+
+    /* seed the lateral spread: lit cells bordering dimmer transparent cells */
+    for (int y = 0; y < WORLD_H; y++)
+        for (int z = 0; z < WZ; z++)
+            for (int x = 0; x < WX; x++) {
+                int L = g_lightmap[LIDX(x, y, z)] >> 4;
+                if (L <= 1) continue;
+                for (int d = 0; d < 6; d++) {
+                    int nx = x + LDIR[d][0], ny = y + LDIR[d][1],
+                        nz = z + LDIR[d][2];
+                    if (nx < 0 || nz < 0 || ny < 0 ||
+                        nx >= WX || nz >= WZ || ny >= WORLD_H) continue;
+                    if (!IS_TRANSPARENT(g_world[ny][nz][nx])) continue;
+                    if ((g_lightmap[LIDX(nx, ny, nz)] >> 4) < L - 1) {
+                        if (tail < LQCAP - 1)
+                            g_lq[tail++] = LPACK(x, y, z);
+                        break;
+                    }
+                }
+            }
+    light_add_bfs(0, g_lq, 0, tail);
+
+    /* torches */
+    tail = 0;
+    for (int y = 0; y < WORLD_H; y++)
+        for (int z = 0; z < WZ; z++)
+            for (int x = 0; x < WX; x++)
+                if (g_world[y][z][x] == B_TORCH) {
+                    lset(1, x, y, z, 14);
+                    if (tail < LQCAP - 1)
+                        g_lq[tail++] = LPACK(x, y, z);
+                }
+    light_add_bfs(1, g_lq, 0, tail);
 }
 
 static int terrain_h(int x, int z)
@@ -464,14 +674,18 @@ static const BYTE TILE_FOR[NBLOCKS][6] = {
     [B_COBBLE] = { T_COBBLE, T_COBBLE, T_COBBLE, T_COBBLE, T_COBBLE,
                    T_COBBLE },
     [B_COAL]   = { T_COAL, T_COAL, T_COAL, T_COAL, T_COAL, T_COAL },
+    [B_TORCH]  = { T_TORCH, T_TORCH, T_TORCH, T_TORCH, T_TORCH, T_TORCH },
 };
 
-typedef struct { BYTE tile, face; BYTE x0, x1, y0, y1, z0, z1; } QUAD;
+typedef struct { BYTE tile, face, light, torch;
+                 BYTE x0, x1, y0, y1, z0, z1; } QUAD;
 #define MAX_QUADS 16000             /* 4*16000 = 64000 verts < 65536 */
 static QUAD g_quads[MAX_QUADS];     /* worker-thread only */
 static int  g_nquads;
 
-static void greedy_2d(BYTE *mask, int nu, int nv,
+/* mask cells carry ((tile+1)<<8 | light) so greedy only merges faces
+ * with the same texture AND the same baked light level */
+static void greedy_2d(WORD *mask, int nu, int nv,
                       void (*emit)(int, int, int, int, int, void *), void *ctx)
 {
     for (int v = 0; v < nv; v++)
@@ -495,12 +709,14 @@ static void greedy_2d(BYTE *mask, int nu, int nv,
 
 typedef struct { int face, slice; } EMITCTX;
 
-static void emit_rect(int u0, int v0, int w, int h, int tile, void *vctx)
+static void emit_rect(int u0, int v0, int w, int h, int key, void *vctx)
 {
     if (g_nquads >= MAX_QUADS) return;
     EMITCTX *e = vctx;
     QUAD *q = &g_quads[g_nquads++];
-    q->tile = (BYTE)tile;
+    q->tile = (BYTE)((key >> 8) - 1);
+    q->light = (BYTE)(key & 15);
+    q->torch = (BYTE)(key & 64 ? 2 : 0);    /* bit 1 = warm-lit */
     q->face = (BYTE)e->face;
     switch (e->face) {
     case F_TOP: case F_BOTTOM:
@@ -535,13 +751,26 @@ static void quad_uv_extent(const QUAD *q, int *w, int *h)
 /* face of `blk` at world (x,y,z) toward neighbor `nb`? */
 static int face_visible(int blk, int nb)
 {
-    if (blk == B_WATER) return nb == B_AIR;
+    if (blk == B_WATER) return nb == B_AIR || nb == B_TORCH;
     return !solid_block(nb);        /* solids show against air AND water */
+}
+
+/* mask key for a visible face: tile + light of the cell it opens into.
+ * Bit 6 marks faces where torch light beats sky light — baked warm. */
+static int face_key(int blk, int f, int nx, int ny, int nz)
+{
+    int nb = block_at(nx, ny, nz);
+    if (!face_visible(blk, nb)) return 0;
+    int s = lget(0, nx, ny, nz) * g_lbucket / 7;
+    int b = lget(1, nx, ny, nz);
+    int warm = b > s ? 64 : 0;
+    int l = b > s ? b : s;
+    return ((TILE_FOR[blk][f] + 1) << 8) | warm | l;
 }
 
 static void mesh_chunk_quads(int cx, int cz)
 {
-    static BYTE mask[CHUNK * WORLD_H];  /* worker-thread only */
+    static WORD mask[CHUNK * WORLD_H];  /* worker-thread only */
     int bx = cx * CHUNK, bz = cz * CHUNK;
     g_nquads = 0;
     EMITCTX e;
@@ -553,11 +782,9 @@ static void mesh_chunk_quads(int cx, int cz)
                 for (int x = 0; x < CHUNK; x++) {
                     int blk = g_world[y][bz + z][bx + x];
                     int t = 0;
-                    if (blk != B_AIR &&
-                        face_visible(blk, block_at(bx + x, y + FACES[f].dy,
-                                                   bz + z)))
-                        t = TILE_FOR[blk][f] + 1;
-                    mask[z * CHUNK + x] = (BYTE)t;
+                    if (blk != B_AIR && blk != B_TORCH)
+                        t = face_key(blk, f, bx + x, y + FACES[f].dy, bz + z);
+                    mask[z * CHUNK + x] = (WORD)t;
                     any |= t;
                 }
             if (!any) continue;
@@ -572,11 +799,9 @@ static void mesh_chunk_quads(int cx, int cz)
                 for (int x = 0; x < CHUNK; x++) {
                     int blk = g_world[y][bz + z][bx + x];
                     int t = 0;
-                    if (blk != B_AIR &&
-                        face_visible(blk, block_at(bx + x, y,
-                                                   bz + z + FACES[f].dz)))
-                        t = TILE_FOR[blk][f] + 1;
-                    mask[y * CHUNK + x] = (BYTE)t;
+                    if (blk != B_AIR && blk != B_TORCH)
+                        t = face_key(blk, f, bx + x, y, bz + z + FACES[f].dz);
+                    mask[y * CHUNK + x] = (WORD)t;
                     any |= t;
                 }
             if (!any) continue;
@@ -591,17 +816,34 @@ static void mesh_chunk_quads(int cx, int cz)
                 for (int z = 0; z < CHUNK; z++) {
                     int blk = g_world[y][bz + z][bx + x];
                     int t = 0;
-                    if (blk != B_AIR &&
-                        face_visible(blk, block_at(bx + x + FACES[f].dx, y,
-                                                   bz + z)))
-                        t = TILE_FOR[blk][f] + 1;
-                    mask[y * CHUNK + z] = (BYTE)t;
+                    if (blk != B_AIR && blk != B_TORCH)
+                        t = face_key(blk, f, bx + x + FACES[f].dx, y, bz + z);
+                    mask[y * CHUNK + z] = (WORD)t;
                     any |= t;
                 }
             if (!any) continue;
             e.face = f; e.slice = x;
             greedy_2d(mask, CHUNK, WORLD_H, emit_rect, &e);
         }
+
+    /* torches: little posts, custom quads, lit by their own cell */
+    for (int y = 0; y < WORLD_H; y++)
+        for (int z = 0; z < CHUNK; z++)
+            for (int x = 0; x < CHUNK; x++) {
+                if (g_world[y][bz + z][bx + x] != B_TORCH) continue;
+                int lit = light_level(bx + x, y, bz + z);
+                for (int f = 0; f < 6; f++) {
+                    if (f == F_BOTTOM || g_nquads >= MAX_QUADS) continue;
+                    QUAD *q = &g_quads[g_nquads++];
+                    q->tile = T_TORCH;
+                    q->face = (BYTE)f;
+                    q->light = (BYTE)lit;
+                    q->torch = 3;   /* custom geometry + warm */
+                    q->x0 = q->x1 = (BYTE)x;
+                    q->y0 = q->y1 = (BYTE)y;
+                    q->z0 = q->z1 = (BYTE)z;
+                }
+            }
 }
 
 /* worker: mesh one chunk into malloc'd vertex/index arrays */
@@ -628,22 +870,35 @@ static void worker_build(int cx, int cz)
         c->pib_start[t] = ii;
         for (int n = 0; n < g_nquads; n++) {
             const QUAD *q = &g_quads[n];
-            if (q->tile != t + 1) continue;
-            int s = 255 * FACES[q->face].shade / 100;
-            DWORD col = (t == T_WATER) ? D3DCOLOR_ARGB(160, s, s, s)
-                                       : D3DCOLOR_ARGB(255, s, s, s);
+            if (q->tile != t) continue;
+            /* face shade x baked light level; torch-dominated light is
+             * tinted warm so pools of torchlight read at a glance */
+            int s = FACES[q->face].shade * g_bright[q->light] / 100;
+            if (s > 255) s = 255;
+            int sg = (q->torch & 2) ? s * 225 / 255 : s;
+            int sb = (q->torch & 2) ? s * 170 / 255 : s;
+            DWORD col = (t == T_WATER) ? D3DCOLOR_ARGB(160, s, sg, sb)
+                                       : D3DCOLOR_ARGB(255, s, sg, sb);
             int uw, vh;
             quad_uv_extent(q, &uw, &vh);
             float uvw[4][2] = { {0,0}, {(float)uw,0},
                                 {(float)uw,(float)vh}, {0,(float)vh} };
             for (int k = 0; k < 4; k++) {
                 const BYTE *o = FACES[q->face].c[k];
-                verts[vi + k].x = (float)(bx + (o[0] ? q->x1 + 1 : q->x0));
-                verts[vi + k].y = (float)(     (o[1] ? q->y1 + 1 : q->y0));
-                verts[vi + k].z = (float)(bz + (o[2] ? q->z1 + 1 : q->z0));
+                if (q->torch & 1) { /* shrunken post: 0.25 wide, 0.62 tall */
+                    verts[vi + k].x = bx + q->x0 + (o[0] ? 0.625f : 0.375f);
+                    verts[vi + k].y =      q->y0 + (o[1] ? 0.625f : 0.0f);
+                    verts[vi + k].z = bz + q->z0 + (o[2] ? 0.625f : 0.375f);
+                    verts[vi + k].u = (float)((k == 1 || k == 2) ? 1 : 0);
+                    verts[vi + k].v = (float)(k >= 2 ? 1 : 0);
+                } else {
+                    verts[vi + k].x = (float)(bx + (o[0] ? q->x1 + 1 : q->x0));
+                    verts[vi + k].y = (float)(     (o[1] ? q->y1 + 1 : q->y0));
+                    verts[vi + k].z = (float)(bz + (o[2] ? q->z1 + 1 : q->z0));
+                    verts[vi + k].u = uvw[k][0];
+                    verts[vi + k].v = uvw[k][1];
+                }
                 verts[vi + k].color = col;
-                verts[vi + k].u = uvw[k][0];
-                verts[vi + k].v = uvw[k][1];
             }
             idx[ii++] = (WORD)vi;       idx[ii++] = (WORD)(vi + 1);
             idx[ii++] = (WORD)(vi + 2); idx[ii++] = (WORD)vi;
@@ -821,7 +1076,18 @@ static void set_block(int x, int y, int z, int b)
 {
     if (x < 0 || y < 1 || z < 0 || x >= WX || y >= WORLD_H || z >= WZ)
         return;
+    int oldb = g_world[y][z][x];
     g_world[y][z][x] = (BYTE)b;
+
+    /* relight, then dirty every chunk the light change touched */
+    g_lmin[0] = g_lmax[0] = x;
+    g_lmin[2] = g_lmax[2] = z;
+    relight_change(x, y, z, oldb, b);
+    for (int mz = (g_lmin[2] - 1) / CHUNK; mz <= (g_lmax[2] + 1) / CHUNK; mz++)
+        for (int mx = (g_lmin[0] - 1) / CHUNK;
+             mx <= (g_lmax[0] + 1) / CHUNK; mx++)
+            mark_dirty(mx, mz);
+
     int cx = x / CHUNK, cz = z / CHUNK;
     mark_dirty(cx, cz);
     if (x % CHUNK == 0)         mark_dirty(cx - 1, cz);
@@ -1026,6 +1292,7 @@ static void edit_place(void)
     if (!raycast(hit, prev)) return;
     int pb = block_at(prev[0], prev[1], prev[2]);
     if (pb != B_AIR && pb != B_WATER) return;
+    if (g_sel == B_TORCH && pb == B_WATER) return;  /* no underwater fire */
     int ex = (int)floorf(g_cam_x), ey = (int)floorf(g_cam_y),
         ez = (int)floorf(g_cam_z);
     if (prev[0] == ex && prev[2] == ez &&
@@ -1046,6 +1313,7 @@ typedef struct { const char *name, *cost; int out, outn, in1, n1, in2, n2; }
 static const RECIPE RECIPES[] = {
     { "4 planks",      "1 log",              B_PLANKS,  4, B_LOG,    1, -1, 0 },
     { "4 sticks",      "2 planks",           I_STICK,   4, B_PLANKS, 2, -1, 0 },
+    { "4 torches",     "1 stick + 1 coal",   B_TORCH,   4, I_STICK,  1, B_COAL, 1 },
     { "wood pickaxe",  "3 planks + 2 sticks", I_WPICK,  1, B_PLANKS, 3, I_STICK, 2 },
     { "wood axe",      "3 planks + 2 sticks", I_WAXE,   1, B_PLANKS, 3, I_STICK, 2 },
     { "wood shovel",   "1 plank + 2 sticks",  I_WSHOVEL, 1, B_PLANKS, 1, I_STICK, 2 },
@@ -1470,7 +1738,7 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x36435058 /* "XPC6" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x37435058 /* "XPC7" */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
     float ext[5] = { g_spawn_x, g_spawn_y, g_spawn_z,
@@ -1492,7 +1760,7 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        hdr[0] < 0x32435058 || hdr[0] > 0x36435058 ||
+        hdr[0] < 0x32435058 || hdr[0] > 0x37435058 ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1502,19 +1770,28 @@ static int load_world(void)
     g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
     if (hdr[0] >= 0x34435058) {         /* v4+: spawn + vitals */
         float ext[5];
-        int ninv = hdr[0] >= 0x36435058 ? NITEMS
-                 : hdr[0] == 0x35435058 ? NITEMS_V5 : NBLOCKS;
+        int ninv = hdr[0] >= 0x37435058 ? NITEMS
+                 : hdr[0] == 0x36435058 ? NITEMS_V6
+                 : hdr[0] == 0x35435058 ? NITEMS_V5 : NBLOCKS_V6;
+        int tmp[64] = {0};
         if (fread(ext, sizeof ext, 1, fp) != 1 ||
-            fread(g_inv, sizeof(int) * ninv, 1, fp) != 1) {
+            fread(tmp, sizeof(int) * ninv, 1, fp) != 1) {
             fclose(fp);
             return 0;
+        }
+        if (hdr[0] >= 0x37435058) {
+            memcpy(g_inv, tmp, sizeof(int) * NITEMS);
+        } else {                        /* B_TORCH inserted at 11: old item
+                                           ids >= 11 shift up by one */
+            for (int i = 0; i < ninv && i < 64; i++)
+                g_inv[i < NBLOCKS_V6 ? i : i + 1] = tmp[i];
         }
         g_spawn_x = ext[0]; g_spawn_y = ext[1]; g_spawn_z = ext[2];
         g_health = (int)ext[3];
         g_air = ext[4];
         if (g_health <= 0 || g_health > 20) g_health = 20;
     } else if (hdr[0] == 0x33435058) {  /* v3: block inventory only */
-        if (fread(g_inv, sizeof(int) * NBLOCKS, 1, fp) != 1) {
+        if (fread(g_inv, sizeof(int) * NBLOCKS_V6, 1, fp) != 1) {
             fclose(fp);
             return 0;
         }
@@ -1696,6 +1973,15 @@ static void tile_pixel(int tile, int x, int y, int *r, int *g, int *b)
         if (((x / 6) * 31 + (y / 6) * 17) % 7 < 2 &&
             (rng() & 3)) { *r = *g = *b = 28 + (int)(rng() % 18); }
         break;
+    case T_TORCH:                       /* glowing tip over a wood shaft */
+        n = (int)(rng() % 30);
+        if (y < 18) {
+            *r = 250; *g = 190 + n; *b = 60 + n;
+            if (y < 6) { *r = 255; *g = 240; *b = 150; }
+        } else {
+            *r = 140 + n - 15; *g = 105 + n - 15; *b = 70 + n - 15;
+        }
+        return;                         /* no dark border on torches */
     default:                            /* T_STONE */
         n = (int)(rng() % 35);
         *r = *g = *b = 110 + n - 17;
@@ -2384,17 +2670,8 @@ static int init_d3d(HWND hwnd)
     IDirect3DDevice9_SetTextureStageState(g_dev, 0, D3DTSS_ALPHAARG2,
                                           D3DTA_DIFFUSE);
 
-    /* stage 1 scales everything by daylight (TEXTUREFACTOR) */
-    IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_COLOROP,
-                                          D3DTOP_MODULATE);
-    IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_COLORARG1,
-                                          D3DTA_CURRENT);
-    IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_COLORARG2,
-                                          D3DTA_TFACTOR);
-    IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_ALPHAOP,
-                                          D3DTOP_SELECTARG1);
-    IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_ALPHAARG1,
-                                          D3DTA_CURRENT);
+    /* (per-block lighting is baked into vertex colors at mesh time now —
+     * the old stage-1 TEXTUREFACTOR daylight dimmer is gone) */
 
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, TRUE);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGVERTEXMODE,
@@ -2426,18 +2703,29 @@ static void update_daylight(float dt)
     int b = (int)(28 + (235 - 28) * k);
     g_sky_color = D3DCOLOR_XRGB(r, g, b);
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGCOLOR, g_sky_color);
-    int li = (int)(L * 255);
-    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_TEXTUREFACTOR,
-                                    D3DCOLOR_ARGB(255, li, li, li));
+
+    /* sky-light bucket: when it steps, re-bake built chunks gradually.
+     * Night (L=0.30) maps to bucket 3 — matches the playtested night
+     * brightness; full day is bucket 7. */
+    int nb = (int)(1 + L * 6 + 0.5f);
+    if (nb > 7) nb = 7;
+    if (nb != g_lbucket) {
+        g_lbucket = nb;
+        for (int cz = 0; cz < WORLD_CZ; cz++)
+            for (int cx = 0; cx < WORLD_CX; cx++)
+                if (g_chunks[cz][cx].vb)
+                    g_chunks[cz][cx].dirty = 1;
+    }
 }
 
 /* mob-local textured box: center c, half-extents e, into 36 verts */
 static int emit_box(VTX *v, float cx, float cy, float cz,
-                    float ex, float ey, float ez, int hurt)
+                    float ex, float ey, float ez, int hurt, int lit)
 {
     int vi = 0;
     for (int f = 0; f < 6; f++) {
-        int s = 255 * FACES[f].shade / 100;
+        int s = FACES[f].shade * lit / 100;
+        if (s > 255) s = 255;
         DWORD col = hurt ? D3DCOLOR_ARGB(255, s, s / 3, s / 3)
                          : D3DCOLOR_ARGB(255, s, s, s);
         float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
@@ -2472,12 +2760,17 @@ static void draw_mobs(void)
 
         VTX mv[72];
         int n, hurt = g_mob[i].hurt_t > 0;
+        int lit = g_bright[light_level((int)floorf(g_mob[i].x),
+                                       (int)floorf(g_mob[i].y + 0.5f),
+                                       (int)floorf(g_mob[i].z))];
         if (g_mob[i].type == M_PIG) {
-            n  = emit_box(mv, 0, 0.50f, 0, 0.30f, 0.25f, 0.45f, hurt);
-            n += emit_box(mv + n, 0, 0.62f, 0.55f, 0.22f, 0.22f, 0.20f, hurt);
+            n  = emit_box(mv, 0, 0.50f, 0, 0.30f, 0.25f, 0.45f, hurt, lit);
+            n += emit_box(mv + n, 0, 0.62f, 0.55f, 0.22f, 0.22f, 0.20f,
+                          hurt, lit);
         } else {
-            n  = emit_box(mv, 0, 0.55f, 0, 0.25f, 0.55f, 0.15f, hurt);
-            n += emit_box(mv + n, 0, 1.34f, 0, 0.24f, 0.24f, 0.24f, hurt);
+            n  = emit_box(mv, 0, 0.55f, 0, 0.25f, 0.55f, 0.15f, hurt, lit);
+            n += emit_box(mv + n, 0, 1.34f, 0, 0.24f, 0.24f, 0.24f,
+                          hurt, lit);
         }
         IDirect3DDevice9_SetTexture(g_dev, 0,
             (IDirect3DBaseTexture9 *)g_mobtex[g_mob[i].type == M_PIG ? 0 : 1]);
@@ -2501,9 +2794,6 @@ static void render_frame(void)
     g_drawn_chunks = 0;
 
     if (SUCCEEDED(IDirect3DDevice9_BeginScene(g_dev))) {
-        /* re-arm the daylight stage (HUD disables it at the end of a frame) */
-        IDirect3DDevice9_SetTextureStageState(g_dev, 1, D3DTSS_COLOROP,
-                                              D3DTOP_MODULATE);
         D3DMATRIX world = mat_identity();
         D3DMATRIX view  = mat_view();
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &world);
@@ -2585,7 +2875,10 @@ static void render_frame(void)
                         continue;
                     float px = g_part[i].x, py = g_part[i].y,
                           pz = g_part[i].z;
-                    DWORD col = D3DCOLOR_ARGB(255, 220, 220, 220);
+                    int pl = g_bright[light_level((int)px, (int)py,
+                                                  (int)pz)];
+                    int pv8 = 220 * pl / 255;
+                    DWORD col = D3DCOLOR_ARGB(255, pv8, pv8, pv8);
                     VTX q[6] = {
                         { px - rxv, py + 0.09f, pz - rzv, col, 0.1f, 0.1f },
                         { px + rxv, py + 0.09f, pz + rzv, col, 0.4f, 0.1f },
@@ -2692,8 +2985,12 @@ static void render_frame(void)
 
             VTX hv[36];
             int vi = 0;
+            int hlit = g_bright[light_level((int)floorf(g_cam_x),
+                                            (int)floorf(g_cam_y),
+                                            (int)floorf(g_cam_z))];
             for (int f = 0; f < 6; f++) {
-                int s = 255 * FACES[f].shade / 100;
+                int s = FACES[f].shade * hlit / 100;
+                if (s > 255) s = 255;
                 DWORD col = D3DCOLOR_ARGB(255, s, s, s);
                 float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
                 VTX c4[4];
@@ -2739,10 +3036,14 @@ static void render_frame(void)
                 if (clk >= 24) clk -= 24;
                 int hh = (int)clk, mm = (int)(clk * 60) % 60;
                 sprintf(line, "FPS %.0f  R%.0f  TRIS %d  CH %d  %s  "
-                        "X%.0f Y%.0f Z%.0f  %02d:%02d",
+                        "X%.0f Y%.0f Z%.0f  %02d:%02d  L%d/%d",
                         g_fps, g_range, g_drawn_tris,
                         g_drawn_chunks, g_walk ? "SURVIVAL" : "CREATIVE",
-                        g_cam_x, g_cam_y, g_cam_z, hh, mm);
+                        g_cam_x, g_cam_y, g_cam_z, hh, mm,
+                        lget(0, (int)floorf(g_cam_x), (int)floorf(g_cam_y),
+                             (int)floorf(g_cam_z)),
+                        lget(1, (int)floorf(g_cam_x), (int)floorf(g_cam_y),
+                             (int)floorf(g_cam_z)));
                 draw_text(8, 6, line, D3DCOLOR_ARGB(200, 255, 255, 255));
             }
             if (g_toast_t > 0) {
@@ -2874,7 +3175,11 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
     update_daylight(0);
 
     g_world = calloc(1, (size_t)WORLD_H * WZ * WX);
-    if (!g_world) return 1;
+    g_lightmap = calloc(1, (size_t)WORLD_H * WZ * WX);
+    g_lq  = malloc(sizeof(int) * LQCAP);
+    g_lq2 = malloc(sizeof(int) * LQCAP);
+    if (!g_world || !g_lightmap || !g_lq || !g_lq2) return 1;
+    init_bright();
 
     world_file_path();
     g_pad_mapped = pad_load("C:\\XP_Share\\pad.cfg");
@@ -2907,6 +3212,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         g_spawn_y = g_cam_y;
         g_spawn_z = g_cam_z;
     }
+    loading_frame("LIGHTING WORLD...");
+    full_relight();
+
     if (g_bench) g_walk = 0;
     if (ta) g_tod = arg_tod;        /* time= wins over the saved time */
     if (aa) {                       /* dev teleport: at=x,z */
@@ -2918,6 +3226,49 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_manual = 1;
             g_pitch = 0.5f;
         }
+    }
+
+    if (cmdline && strstr(cmdline, "torchtest")) { /* dev: torch + camera */
+        int tx = (int)g_cam_x + 3, tz = (int)g_cam_z;
+        int ty = WORLD_H - 1;
+        while (ty > 1 && !solid_block(g_world[ty - 1][tz][tx])) ty--;
+        /* direct write + relight: the mesh queue isn't up yet, so no
+         * set_block (it would touch the uninitialized worker queue) */
+        g_world[ty][tz][tx] = B_TORCH;
+        relight_change(tx, ty, tz, B_AIR, B_TORCH);
+        g_cam_x = tx - 3.5f; g_cam_z = tz + 0.5f;
+        g_cam_y = ty + 1.5f;
+        g_yaw = 1.5708f; g_pitch = 0.25f;
+        g_walk = 0; g_manual = 1;
+    }
+
+    if (cmdline && strstr(cmdline, "cavetest")) {  /* dev: torch in a cave */
+        int fx = (int)g_cam_x, fz = (int)g_cam_z, done = 0;
+        for (int r = 0; r < 40 && !done; r++)
+            for (int dz = -r; dz <= r && !done; dz += (r ? 2 * r : 1))
+                for (int dx = -r; dx <= r && !done; dx++) {
+                    int tx = fx + dx, tz = fz + dz;
+                    if (tx < 8 || tz < 8 || tx >= WX - 8 || tz >= WZ - 8)
+                        continue;
+                    for (int ty = 6; ty < 24; ty++) {
+                        if (g_world[ty][tz][tx] != B_AIR ||
+                            g_world[ty + 1][tz][tx] != B_AIR ||
+                            !solid_block(g_world[ty - 1][tz][tx]))
+                            continue;
+                        /* open cave toward -x so the camera fits */
+                        if (g_world[ty][tz][tx - 3] != B_AIR ||
+                            g_world[ty + 1][tz][tx - 3] != B_AIR)
+                            continue;
+                        g_world[ty][tz][tx] = B_TORCH;
+                        relight_change(tx, ty, tz, B_AIR, B_TORCH);
+                        g_cam_x = tx - 3.0f; g_cam_z = tz + 0.5f;
+                        g_cam_y = ty + 1.4f;
+                        g_yaw = 1.5708f; g_pitch = 0.15f;
+                        g_walk = 0; g_manual = 1;
+                        done = 1;
+                        break;
+                    }
+                }
     }
 
     if (cmdline && strstr(cmdline, "mobtest")) {   /* dev: critters up close */
