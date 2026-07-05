@@ -146,6 +146,9 @@ static int  g_windowed;
 static int  g_glyph_w = 10;
 
 static float g_range = 48.0f;      /* ~30 FPS on the box (bench curve) */
+static int   g_volume = 35;         /* master volume 0..100 */
+static void  apply_range(void);     /* fwd: projection + fog follow range */
+#define NMENU 5                     /* pause menu rows */
 
 /* camera = player eye */
 static float g_cam_x, g_cam_y, g_cam_z;
@@ -1950,11 +1953,12 @@ static void save_world(void)
 {
     FILE *fp = fopen(g_world_file, "wb");
     if (!fp) return;
-    int hdr[4] = { 0x39435058 /* "XPC9" */, WX, WZ, WORLD_H };
+    int hdr[4] = { 0x3A435058 /* "XPC:" v10 */, WX, WZ, WORLD_H };
     float st[8] = { g_cam_x, g_cam_y, g_cam_z, g_yaw, g_pitch,
                     (float)g_walk, (float)g_hotbar_idx, g_tod };
-    float ext[6] = { g_spawn_x, g_spawn_y, g_spawn_z,
-                     (float)g_health, g_air, g_food };
+    float ext[8] = { g_spawn_x, g_spawn_y, g_spawn_z,
+                     (float)g_health, g_air, g_food,
+                     g_range, (float)g_volume };
     fwrite(hdr, sizeof hdr, 1, fp);
     fwrite(st, sizeof st, 1, fp);
     fwrite(ext, sizeof ext, 1, fp);
@@ -1977,7 +1981,7 @@ static int load_world(void)
     int hdr[4] = {0};
     float st[8];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 ||
-        hdr[0] < 0x32435058 || hdr[0] > 0x39435058 ||
+        hdr[0] < 0x32435058 || hdr[0] > 0x3A435058 ||
         hdr[1] != WX || hdr[2] != WZ || hdr[3] != WORLD_H ||
         fread(st, sizeof st, 1, fp) != 1) {
         fclose(fp);
@@ -1986,8 +1990,9 @@ static int load_world(void)
     memset(g_inv, 0, sizeof g_inv);
     g_spawn_x = st[0]; g_spawn_y = st[1]; g_spawn_z = st[2];
     if (hdr[0] >= 0x34435058) {         /* v4+: spawn + vitals */
-        float ext[6] = { 0, 0, 0, 20, 10, 20 };
-        int next = hdr[0] >= 0x38435058 ? 6 : 5;
+        float ext[8] = { 0, 0, 0, 20, 10, 20, 0, -1 };
+        int next = hdr[0] >= 0x3A435058 ? 8
+                 : hdr[0] >= 0x38435058 ? 6 : 5;
         int ninv, oldnb;                /* inventory size + block count then */
         if      (hdr[0] >= 0x38435058) { ninv = NITEMS;    oldnb = NBLOCKS; }
         else if (hdr[0] == 0x37435058) { ninv = NITEMS_V7; oldnb = NBLOCKS_V7; }
@@ -2008,6 +2013,8 @@ static int load_world(void)
         g_health = (int)ext[3];
         g_air = ext[4];
         g_food = ext[5];
+        if (ext[6] >= 32 && ext[6] <= 192) g_range = ext[6];
+        if (ext[7] >= 0 && ext[7] <= 100)  g_volume = (int)ext[7];
         if (g_health <= 0 || g_health > 20) g_health = 20;
         if (g_food < 0 || g_food > 20) g_food = 20;
     } else if (hdr[0] == 0x33435058) {  /* v3: block inventory only */
@@ -2048,7 +2055,6 @@ static int load_world(void)
 #define NSOUNDS 7               /* dig place step jump hurt groan oink */
 static struct { short *pcm; int len; } g_snd[NSOUNDS];
 static struct { HWAVEOUT h; WAVEHDR hdr; int busy; } g_voice[4];
-static int g_volume = 35;
 
 static void gen_sounds(void)
 {
@@ -2109,9 +2115,8 @@ static void gen_sounds(void)
         g_snd[s].len = len;
     }
 
-    if (g_volume <= 0) return;
     WAVEFORMATEX fmt = { WAVE_FORMAT_PCM, 1, SND_HZ, SND_HZ * 2, 2, 16, 0 };
-    DWORD v = (DWORD)(g_volume * 65535 / 100);
+    DWORD v = (DWORD)((g_volume > 0 ? g_volume : 35) * 65535 / 100);
     for (int i = 0; i < 4; i++) {
         if (waveOutOpen(&g_voice[i].h, WAVE_MAPPER, &fmt, 0, 0,
                         CALLBACK_NULL) != MMSYSERR_NOERROR) {
@@ -2651,17 +2656,24 @@ static void draw_crosshair(void)
 
 static void draw_menu(void)
 {
-    static const char *ITEMS[3] = { "RESUME", "SAVE WORLD", "QUIT" };
+    (void)0;
     hud_quad(0, 0, (float)g_win_w, (float)g_win_h,
              D3DCOLOR_ARGB(150, 0, 0, 8), NULL, 0, 0, 0, 0);
     float cx = g_win_w / 2.0f, y = g_win_h / 2.0f - 90;
     draw_text(cx - 3 * g_glyph_w, y, "PAUSED",
               D3DCOLOR_ARGB(255, 255, 255, 255));
     y += 50;
-    for (int i = 0; i < 3; i++) {
-        char line[32];
-        sprintf(line, "%s%s", i == g_menu_sel ? "> " : "  ", ITEMS[i]);
-        draw_text(cx - 6 * g_glyph_w, y,
+    for (int i = 0; i < NMENU; i++) {
+        char line[48];
+        const char *pre = i == g_menu_sel ? "> " : "  ";
+        switch (i) {
+        case 0: sprintf(line, "%sRESUME", pre); break;
+        case 1: sprintf(line, "%sSAVE WORLD", pre); break;
+        case 2: sprintf(line, "%sRANGE    < %.0f >", pre, g_range); break;
+        case 3: sprintf(line, "%sVOLUME   < %d >", pre, g_volume); break;
+        default: sprintf(line, "%sQUIT", pre); break;
+        }
+        draw_text(cx - 8 * g_glyph_w, y,
                   line, i == g_menu_sel ? D3DCOLOR_ARGB(255, 255, 230, 120)
                                         : D3DCOLOR_ARGB(220, 200, 200, 210));
         y += 30;
@@ -2686,11 +2698,27 @@ static void apply_range(void)
     IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGEND, fe.d);
 }
 
+#define NMENU 5
 static void menu_activate(void)
 {
     if (g_menu_sel == 0) g_paused = 0;
     else if (g_menu_sel == 1) save_world();
-    else { save_world(); DestroyWindow(g_hwnd); }
+    else if (g_menu_sel == 4) { save_world(); DestroyWindow(g_hwnd); }
+}
+
+/* left/right on the RANGE / VOLUME rows */
+static void menu_adjust(int dir)
+{
+    if (g_menu_sel == 2) {
+        g_range += dir * 16;
+        if (g_range < 32) g_range = 32;
+        if (g_range > 128) g_range = 128;
+        apply_range();
+    } else if (g_menu_sel == 3) {
+        g_volume += dir * 10;
+        if (g_volume < 0) g_volume = 0;
+        if (g_volume > 100) g_volume = 100;
+    }
 }
 
 static void update_camera(float dt, float t)
@@ -2763,8 +2791,13 @@ static void update_gamepad_mapped(float dt)
         return;
     }
     if (g_paused) {                     /* menu navigation */
-        if (p.up && !prev_up)     g_menu_sel = (g_menu_sel + 2) % 3;
-        if (p.down && !prev_down) g_menu_sel = (g_menu_sel + 1) % 3;
+        static unsigned prev_l, prev_r;
+        if (p.up && !prev_up)
+            g_menu_sel = (g_menu_sel + NMENU - 1) % NMENU;
+        if (p.down && !prev_down) g_menu_sel = (g_menu_sel + 1) % NMENU;
+        if (p.left && !prev_l)  menu_adjust(-1);
+        if (p.right && !prev_r) menu_adjust(1);
+        prev_l = p.left; prev_r = p.right;
         if (p.cross && !prev_cross) menu_activate();
         if ((p.start && !prev_start) || (p.circle))
             g_paused = 0;
@@ -2882,8 +2915,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_paused) {
-            if (w == VK_UP)     g_menu_sel = (g_menu_sel + 2) % 3;
-            if (w == VK_DOWN)   g_menu_sel = (g_menu_sel + 1) % 3;
+            if (w == VK_UP)   g_menu_sel = (g_menu_sel + NMENU - 1) % NMENU;
+            if (w == VK_DOWN)   g_menu_sel = (g_menu_sel + 1) % NMENU;
+            if (w == VK_LEFT)   menu_adjust(-1);
+            if (w == VK_RIGHT)  menu_adjust(1);
             if (w == VK_RETURN) menu_activate();
             if (w == VK_ESCAPE) g_paused = 0;
             return 0;
@@ -3154,6 +3189,85 @@ static void draw_drops(void)
 static int g_drawn_tris, g_drawn_chunks;
 float g_fps;                        /* shared with the stats HUD */
 
+/* one camera-anchored billboard square in world-space direction d */
+static void sky_quad(float dx, float dy, float dz, float hs, DWORD col)
+{
+    float r = g_range * 1.4f;
+    if (r < 80) r = 80;
+    r *= 0.88f;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    dx /= len; dy /= len; dz /= len;
+    /* u = dir x up, v = u x dir */
+    float ux = -dz, uy = 0, uz = dx;
+    float ul = sqrtf(ux * ux + uz * uz);
+    if (ul < 0.01f) { ux = 1; uz = 0; ul = 1; }
+    ux /= ul; uz /= ul;
+    float vx = uy * dz - uz * dy, vy = uz * dx - ux * dz,
+          vz = ux * dy - uy * dx;
+    float cxp = g_cam_x + dx * r, cyp = g_cam_y + dy * r,
+          czp = g_cam_z + dz * r;
+    VTX q[6];
+    float c[4][3] = {
+        { cxp - (ux + vx) * hs, cyp - (uy + vy) * hs, czp - (uz + vz) * hs },
+        { cxp + (ux - vx) * hs, cyp + (uy - vy) * hs, czp + (uz - vz) * hs },
+        { cxp + (ux + vx) * hs, cyp + (uy + vy) * hs, czp + (uz + vz) * hs },
+        { cxp - (ux - vx) * hs, cyp - (uy - vy) * hs, czp - (uz - vz) * hs },
+    };
+    int order[6] = { 0, 1, 2, 0, 2, 3 };
+    for (int i = 0; i < 6; i++) {
+        q[i].x = c[order[i]][0];
+        q[i].y = c[order[i]][1];
+        q[i].z = c[order[i]][2];
+        q[i].color = col;
+        q[i].u = q[i].v = 0;
+    }
+    IDirect3DDevice9_DrawPrimitiveUP(g_dev, D3DPT_TRIANGLELIST, 2, q,
+                                     sizeof(VTX));
+}
+
+/* stars, then the sun or moon, drawn first with no depth writes */
+static void draw_sky_bodies(void)
+{
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_FALSE);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, FALSE);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    IDirect3DDevice9_SetTexture(g_dev, 0, NULL);
+    hud_solidcolor(1);
+    IDirect3DDevice9_SetFVF(g_dev, VTX_FVF);
+
+    if (g_daylight < 0.55f) {           /* stars fade in at dusk */
+        int a = (int)((0.55f - g_daylight) / 0.25f * 255);
+        if (a > 235) a = 235;
+        IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE, TRUE);
+        for (int i = 0; i < 90; i++) {
+            unsigned h = hash2u(i * 37 + 11, i * 91 + 5);
+            float az = (h & 1023) / 1023.0f * 6.2832f;
+            float el = 0.12f + ((h >> 10) & 511) / 511.0f * 1.25f;
+            sky_quad(cosf(az) * cosf(el), sinf(el), sinf(az) * cosf(el),
+                     0.55f + ((h >> 20) & 3) * 0.18f,
+                     D3DCOLOR_ARGB(a, 255, 255, 240));
+        }
+        IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ALPHABLENDENABLE,
+                                        FALSE);
+    }
+
+    /* sun crosses the day (tod 0..0.45), moon the night (0.55..0.95) */
+    if (g_tod < 0.47f) {
+        float a = g_tod / 0.45f * 3.14159f;
+        sky_quad(cosf(a), sinf(a) * 0.92f + 0.06f, 0.35f, 6.5f,
+                 D3DCOLOR_XRGB(255, 252, 200));
+    } else if (g_tod > 0.53f && g_tod < 0.97f) {
+        float a = (g_tod - 0.55f) / 0.40f * 3.14159f;
+        sky_quad(cosf(a), sinf(a) * 0.92f + 0.06f, 0.35f, 4.2f,
+                 D3DCOLOR_XRGB(212, 214, 228));
+    }
+
+    hud_solidcolor(0);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_CULLMODE, D3DCULL_CW);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_FOGENABLE, TRUE);
+    IDirect3DDevice9_SetRenderState(g_dev, D3DRS_ZENABLE, D3DZB_TRUE);
+}
+
 static void render_frame(void)
 {
     IDirect3DDevice9_Clear(g_dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
@@ -3166,6 +3280,7 @@ static void render_frame(void)
         D3DMATRIX view  = mat_view();
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_WORLD, &world);
         IDirect3DDevice9_SetTransform(g_dev, D3DTS_VIEW, &view);
+        if (!g_bench) draw_sky_bodies();
 
         D3DMATRIX proj;
         IDirect3DDevice9_GetTransform(g_dev, D3DTS_PROJECTION, &proj);
@@ -3587,6 +3702,8 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
     }
     loading_frame("LIGHTING WORLD...");
     full_relight();
+    if (va) g_volume = atoi(va + 7);    /* cmdline beats the save */
+    apply_range();                      /* saved range needs a fresh proj */
 
     if (g_bench) g_walk = 0;
     if (ta) g_tod = arg_tod;        /* time= wins over the saved time */
