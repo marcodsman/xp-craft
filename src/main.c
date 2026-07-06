@@ -147,6 +147,10 @@ static int  g_glyph_w = 10;
 
 static float g_range = 48.0f;      /* ~30 FPS on the box (bench curve) */
 static int   g_volume = 35;         /* master volume 0..100 */
+static float g_idle_t;              /* seconds since real input; 5 min ->
+                                       auto-pause so XP can sleep the TV
+                                       (our SetCursorPos otherwise resets
+                                       the monitor-off timer forever) */
 static void  apply_range(void);     /* fwd: projection + fog follow range */
 #define NMENU 5                     /* pause menu rows */
 
@@ -2731,7 +2735,8 @@ static void update_camera(float dt, float t)
     if (GetFocus() != g_hwnd) { g_mouse_reset = 1; return; }
     (void)dt;
 
-    if (GetAsyncKeyState('W') & 0x8000) { g_manual = 1; g_move_f += 1; }
+    if (GetAsyncKeyState('W') & 0x8000) { g_manual = 1; g_move_f += 1;
+                                          g_idle_t = 0; }
     if (GetAsyncKeyState('S') & 0x8000) { g_manual = 1; g_move_f -= 1; }
     if (GetAsyncKeyState('D') & 0x8000) { g_manual = 1; g_move_s += 1; }
     if (GetAsyncKeyState('A') & 0x8000) { g_manual = 1; g_move_s -= 1; }
@@ -2759,6 +2764,7 @@ static void update_camera(float dt, float t)
         SetCursorPos(center.x, center.y);
         return;
     }
+    if (p.x != center.x || p.y != center.y) g_idle_t = 0;
     if (g_manual) {
         g_yaw   += (p.x - center.x) * 0.003f;
         g_pitch += (p.y - center.y) * 0.003f;
@@ -2825,6 +2831,7 @@ static void update_gamepad_mapped(float dt)
         p.cross || p.circle || p.square || p.l2 || p.r2 || p.start) {
         g_manual = 1;
         g_pad_seen = 1;
+        g_idle_t = 0;
     }
 
     g_move_s += strafe;
@@ -2893,7 +2900,7 @@ static void update_gamepad(float dt)
     float sy = ((int)j1.dwYpos - 32767) / 32767.0f;
     if (sx > -0.25f && sx < 0.25f) sx = 0;
     if (sy > -0.25f && sy < 0.25f) sy = 0;
-    if (sx || sy || j1.dwButtons) { g_manual = 1; g_pad_seen = 1; }
+    if (sx || sy || j1.dwButtons) { g_manual = 1; g_pad_seen = 1; g_idle_t = 0; }
     g_move_s += sx;
     g_move_f -= sy;
     if (j1.dwButtons & 0x20) { g_move_u += 1; g_jump = 1; }
@@ -2910,6 +2917,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     switch (m) {
     case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
     case WM_KEYDOWN:
+        g_idle_t = 0;
         if (g_dead) {
             if (w == VK_RETURN || w == VK_SPACE) respawn();
             return 0;
@@ -2948,9 +2956,11 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         else if (w == VK_F5) save_world();
         return 0;
     case WM_LBUTTONDOWN:
+        g_idle_t = 0;
         if (!g_paused) { g_manual = 1; edit_break(); g_click_cd = 0.3f; }
         return 0;
     case WM_RBUTTONDOWN:
+        g_idle_t = 0;
         if (!g_paused) { g_manual = 1; edit_place(); g_click_cd = 0.3f; }
         return 0;
     case WM_MOUSEWHEEL:
@@ -3826,8 +3836,15 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
             g_atk_cd -= dt;
             g_move_s = g_move_f = g_move_u = 0;
             g_jump = g_sprint = g_sneak = 0;
+            g_idle_t += dt;
+            if (g_idle_t > 300 && !g_paused && !g_dead && !g_bench &&
+                g_manual) {
+                g_paused = 1;           /* idle: pause + let the TV sleep */
+                g_menu_sel = 0;
+                save_world();
+            }
             g_break_held = 0;
-            if (!g_paused) update_camera(dt, (float)td);
+            if (!g_paused && !g_dead) update_camera(dt, (float)td);
             update_gamepad(dt);
             if (!g_paused && !g_dead && !g_craft_open) {
                 if (dt > 0.1f) dt = 0.1f;
